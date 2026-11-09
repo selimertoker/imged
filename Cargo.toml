@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/imged-core", "crates/imged"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+
+# ag-psd with a one-line fix: 4-byte padding of the 16/32-bit layer block
+# (see vendor/ag-psd/src/writer.rs, "imged patch").
+[patch.crates-io]
+ag-psd = { path = "vendor/ag-psd" }

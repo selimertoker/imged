@@ -1,0 +1,33 @@
+[package]
+name = "imged"
+description = "A simple, layer-based image editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+imged-core = { path = "../imged-core", default-features = false }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "clipboard"] }
+rfd = "0.17"
+arboard = { version = "3.7", features = ["wayland-data-control"] }
+# Reading the clipboard in any image format (arboard only asks for PNG).
+clipboard-rs = { version = "0.3", default-features = false, features = ["wayland"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Splitting the ImageMagick command line like a shell.
+shell-words = "1"
+# Casting pixel data and shader parameters to bytes for the GPU renderer.
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Waiting for the headless GPU device in the renderer test.
+pollster = "0.4"
+
+[features]
+default = ["heif", "jxl"]
+# HEIC/HEIF through the system libheif (needs libheif-dev to build).
+heif = ["imged-core/heif"]
+# JPEG XL (pure Rust).
+jxl = ["imged-core/jxl"]
+# AVIF decoding through libdav1d (needs the system library).
+avif-decode = ["imged-core/avif-decode"]
