@@ -8,7 +8,7 @@ use crate::geom::{Rect, Vec2};
 use crate::mask::Mask;
 
 /// What to draw and where.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TextSpec {
     pub text: String,
     pub family: String,

@@ -23,6 +23,7 @@ pub mod geom;
 pub mod io;
 pub mod layer;
 pub mod mask;
+pub mod object;
 pub mod ops;
 pub mod pixel;
 pub mod pixels;

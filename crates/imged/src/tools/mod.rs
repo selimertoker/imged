@@ -156,10 +156,7 @@ pub struct PointerEvent {
     pub raw: Vec2,
     pub button: Button,
     pub shift: bool,
-    // Not used by the current tools; available for future modifiers.
-    #[allow(dead_code)]
     pub ctrl: bool,
-    #[allow(dead_code)]
     pub alt: bool,
 }
 
@@ -217,6 +214,13 @@ impl ToolCtx<'_> {
 
     /// Starts a new layer if [`Self::would_start_layer`]; returns whether it did.
     pub fn begin_drawing(&mut self, tool: ToolKind, b: Button) -> bool {
+        // Shape and text layers stay editable: paint goes on a new layer
+        // above them (erasing turns them into pixels instead).
+        let erasing = self.settings.paint_mode == imged_core::ops::paint::PaintMode::Replace && self.color_for(b).a <= 0.0;
+        if self.doc.active_layer().object.is_some() && !erasing {
+            self.exec(Command::NewLayer);
+            self.status.info("Painting on a new layer: shape and text layers stay editable (Rasterize turns them into pixels)");
+        }
         let new = self.would_start_layer(tool, b);
         if new {
             self.exec(Command::NewLayer);

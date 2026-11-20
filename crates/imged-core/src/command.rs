@@ -53,9 +53,15 @@ pub enum Command {
     Stroke { points: Vec<Vec2>, brush: Brush, color: Color, mode: PaintMode },
     /// Square, hard pen: sets the covered pixels to `color` (alpha included).
     Pen { points: Vec<Vec2>, pen: Pen, color: Color },
-    Shape { shape: Shape, color: Color, fill_color: Color, mode: PaintMode },
+    /// Adds a shape layer (it stays editable, see [`crate::object`]).
+    Shape { shape: Shape, color: Color, fill_color: Color },
     Fill { at: Vec2, color: Color, params: RegionParams, sample_merged: bool, mode: PaintMode },
-    Text { spec: TextSpec, color: Color, mode: PaintMode },
+    /// Adds a text layer (it stays editable).
+    Text { spec: TextSpec, color: Color },
+    /// Changes a shape or text layer's object.
+    EditObject { id: LayerId, kind: crate::object::ObjectKind },
+    /// Turns a shape or text layer into plain pixels.
+    Rasterize { id: LayerId },
 
     // --- selections
     SelectRect { rect: Rect, mode: SelectMode },
@@ -181,6 +187,8 @@ impl Command {
             Command::Shape { shape, .. } => shape.kind.label().into(),
             Command::Fill { .. } => "Fill".into(),
             Command::Text { .. } => "Text".into(),
+            Command::EditObject { kind, .. } => (if kind.is_text() { "Edit text" } else { "Edit shape" }).into(),
+            Command::Rasterize { .. } => "Rasterize".into(),
             Command::SelectRect { .. } | Command::SelectMask { .. } => "Selection".into(),
             Command::SelectAll => "Select all".into(),
             Command::SelectNone => "Deselect".into(),
@@ -277,17 +285,10 @@ impl Command {
                 }
                 changed(paint_on_active(doc, "Pen", vec![(mask, color.px())], PaintMode::Replace, ctx.grow_layers))
             }
-            Command::Shape { shape, color, fill_color, mode } => {
-                let (outline, fill) = shape.masks(paint_area(doc, ctx.grow_layers));
-                let fill_px = if shape.fill == crate::ops::paint::ShapeFill::Fill { color.px() } else { fill_color.px() };
-                let mut parts = Vec::new();
-                if let Some(m) = fill {
-                    parts.push((m, fill_px));
-                }
-                if let Some(m) = outline {
-                    parts.push((m, color.px()));
-                }
-                changed(paint_on_active(doc, shape.kind.label(), parts, *mode, ctx.grow_layers))
+            Command::Shape { shape, color, fill_color } => {
+                let kind = crate::object::ObjectKind::Shape { shape: *shape, color: *color, fill_color: *fill_color };
+                let (px, off) = kind.render(doc.default_depth, ctx.fonts.as_deref_mut())?;
+                Ok(Outcome::NewLayer(doc.add_object_layer(kind, px, off)))
             }
             Command::Fill { at, color, params, sample_merged, mode } => {
                 let mask = if *sample_merged {
@@ -303,11 +304,17 @@ impl Command {
                 let Some(mask) = mask else { return Ok(Outcome::Unchanged) };
                 changed(paint_on_active(doc, "Fill", vec![(mask, color.px())], *mode, ctx.grow_layers))
             }
-            Command::Text { spec, color, mode } => {
-                let fonts = ctx.fonts.as_deref_mut().ok_or("No font library available")?;
-                let (mask, _) = fonts.render(spec).ok_or_else(|| format!("Font '{}' not found", spec.family))?;
-                changed(paint_on_active(doc, "Text", vec![(mask, color.px())], *mode, ctx.grow_layers))
+            Command::Text { spec, color } => {
+                let kind = crate::object::ObjectKind::Text { spec: spec.clone(), color: *color };
+                let (px, off) = kind.render(doc.default_depth, ctx.fonts.as_deref_mut())?;
+                Ok(Outcome::NewLayer(doc.add_object_layer(kind, px, off)))
             }
+            Command::EditObject { id, kind } => {
+                let depth = doc.layer(*id).ok_or("No such layer")?.depth();
+                let (px, off) = kind.render(depth, ctx.fonts.as_deref_mut())?;
+                changed(doc.set_layer_object(*id, kind.clone(), px, off))
+            }
+            Command::Rasterize { id } => changed(doc.rasterize(*id)),
             Command::SelectRect { rect, mode } => select(doc, &Mask::full(*rect), *mode),
             Command::SelectMask { mask, mode } => select(doc, mask, *mode),
             Command::MagicWand { at, params, sample_merged, mode } => {
@@ -732,6 +739,7 @@ pub fn paint_on_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::ObjectKind;
     use crate::ops::paint::{ShapeFill, ShapeKind};
 
     #[test]
@@ -746,13 +754,44 @@ mod tests {
             },
             color: Color::BLACK,
             fill_color: Color::rgba(1.0, 0.0, 0.0, 1.0),
-            mode: PaintMode::Replace,
         };
-        assert_eq!(cmd.execute(&mut d, &mut ExecContext::default()), Ok(Outcome::Changed));
-        assert_eq!(d.layers[0].pixels.get(2, 2), Color::BLACK.px());
-        assert_eq!(d.layers[0].pixels.get(6, 6), [1.0, 0.0, 0.0, 1.0]);
-        Command::Undo.execute(&mut d, &mut ExecContext::default()).unwrap();
-        assert_eq!(d.layers[0].pixels.get(6, 6), Color::WHITE.px());
+        let mut ctx = ExecContext::default();
+        let Ok(Outcome::NewLayer(id)) = cmd.execute(&mut d, &mut ctx) else { panic!() };
+        // A new shape layer, still editable.
+        let at = |d: &Document, x, y| crate::composite::composite_document(d, Rect::new(x, y, 1, 1)).get(0, 0);
+        assert_eq!(d.layers.len(), 2);
+        assert_eq!(at(&d, 2, 2), Color::BLACK.px());
+        assert_eq!(at(&d, 6, 6), [1.0, 0.0, 0.0, 1.0]);
+        let Some(ObjectKind::Shape { mut shape, color, fill_color }) = d.layer(id).unwrap().object_now() else { panic!() };
+        // Edit it: green fill, wider; two edits in a row are one undo step.
+        shape.b = Vec2::new(14.0, 14.0);
+        Command::EditObject { id, kind: ObjectKind::Shape { shape, color, fill_color } }.execute(&mut d, &mut ctx).unwrap();
+        let green = Color::rgba(0.0, 1.0, 0.0, 1.0);
+        Command::EditObject { id, kind: ObjectKind::Shape { shape, color, fill_color: green } }.execute(&mut d, &mut ctx).unwrap();
+        assert_eq!(at(&d, 10, 10), green.px());
+        d.undo();
+        assert_eq!(at(&d, 10, 10), Color::WHITE.px());
+        assert_eq!(at(&d, 6, 6), [1.0, 0.0, 0.0, 1.0]);
+        d.redo();
+        // Moving keeps it editable, with the geometry following.
+        let seq = d.next_seq();
+        d.layer_mut(id).unwrap().move_to(seq, (3, 0));
+        let Some(ObjectKind::Shape { shape: moved, .. }) = d.layer(id).unwrap().object_now() else { panic!() };
+        assert_eq!(moved.a, Vec2::new(3.0, 0.0));
+        // A pixel edit turns it into pixels; undo brings the object back.
+        Command::Filter(crate::ops::filters::Filter::Invert, Scope::Layer).execute(&mut d, &mut ctx).unwrap();
+        assert!(d.layer(id).unwrap().object.is_none());
+        d.undo();
+        assert!(d.layer(id).unwrap().object.is_some());
+        Command::Rasterize { id }.execute(&mut d, &mut ctx).unwrap();
+        assert!(d.layer(id).unwrap().object.is_none());
+        assert_eq!(at(&d, 11, 8), green.px());
+        d.undo();
+        assert!(d.layer(id).unwrap().object.is_some());
+        Command::Undo.execute(&mut d, &mut ctx).unwrap();
+        Command::Undo.execute(&mut d, &mut ctx).unwrap();
+        Command::Undo.execute(&mut d, &mut ctx).unwrap();
+        assert_eq!(d.layers.len(), 1);
     }
 
     #[test]
@@ -804,7 +843,6 @@ mod tests {
             },
             color: Color::BLACK,
             fill_color: Color::BLACK,
-            mode: PaintMode::Replace,
         }
         .execute(&mut d, &mut ExecContext::default())
         .unwrap();
@@ -818,7 +856,10 @@ mod tests {
         .unwrap();
         let Outcome::NewLayer(id) = out else { panic!() };
         assert_eq!(d.layer(id).unwrap().bounds(), Rect::new(1, 1, 3, 3));
-        assert_eq!(d.layers[0].pixels.get(2, 2)[3], 0.0);
+        // Cut from the shape layer (which became pixels).
+        let shape = &d.layers[1];
+        assert!(shape.object.is_none());
+        assert_eq!(shape.pixels.get_or_clear(2 - shape.offset.0, 2 - shape.offset.1)[3], 0.0);
     }
 
     #[test]

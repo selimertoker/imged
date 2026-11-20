@@ -230,7 +230,7 @@ impl Pen {
 
 // ----- shapes -------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShapeKind {
     Line,
     Rectangle,
@@ -250,7 +250,7 @@ impl ShapeKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShapeFill {
     /// Outline in the primary color.
     Outline,
@@ -271,7 +271,7 @@ impl ShapeFill {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Shape {
     pub kind: ShapeKind,
     /// Start / end points (for boxes and ellipses: opposite corners).

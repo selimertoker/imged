@@ -54,6 +54,8 @@ pub struct SnapLayer {
     pub group: Option<GroupId>,
     /// Set for filter layers.
     pub filter: Option<LayerFilter>,
+    /// Set for shape and text layers (geometry where the layer is now).
+    pub object: Option<crate::object::ObjectKind>,
 }
 
 impl Snapshot {
@@ -72,6 +74,7 @@ impl Snapshot {
                     opacity: l.opacity,
                     group: l.group,
                     filter: l.filter_on.then_some(l.filter),
+                    object: l.object_now(),
                 })
                 .collect(),
         }
@@ -319,15 +322,19 @@ fn from_psd_adjustment(a: &AdjustmentLayer) -> Option<LayerFilter> {
 }
 
 /// imged's own data in the PSD's XMP metadata: which layers are filter
-/// layers and their settings. Other programs see those layers as hidden
-/// pixel layers (their pixels are the mask).
+/// layers and their settings (other programs see them as hidden pixel
+/// layers: their pixels are the mask), and which are shape or text layers
+/// (other programs see their rendering).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct XmpFilterLayer {
     /// Index in the bottom-to-top layer list.
     index: usize,
     name: String,
     visible: bool,
-    filter: LayerFilter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<LayerFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object: Option<crate::object::ObjectKind>,
 }
 
 const XMP_OPEN: &str = "<imged:filterLayers>";
@@ -448,8 +455,13 @@ pub fn encode(snap: &Snapshot) -> Result<(Vec<u8>, Depth), String> {
                 .layers
                 .iter()
                 .enumerate()
-                .filter_map(|(index, l)| {
-                    Some(XmpFilterLayer { index, name: l.name.clone(), visible: l.visible, filter: l.filter? })
+                .filter(|(_, l)| l.filter.is_some() || l.object.is_some())
+                .map(|(index, l)| XmpFilterLayer {
+                    index,
+                    name: l.name.clone(),
+                    visible: l.visible,
+                    filter: l.filter,
+                    object: l.object.clone(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -602,9 +614,14 @@ pub fn load_bytes(bytes: &[u8]) -> Result<Document, String> {
     let xmp = psd.image_resources.as_ref().and_then(|r| r.xmp_metadata.as_deref()).unwrap_or("");
     for e in parse_filter_xmp(xmp) {
         if let Some(l) = layers.get_mut(e.index).filter(|l| l.name == e.name) {
-            l.filter_on = true;
-            l.filter = e.filter;
-            l.visible = e.visible;
+            if let Some(f) = e.filter {
+                l.filter_on = true;
+                l.filter = f;
+                l.visible = e.visible;
+            }
+            if let Some(kind) = e.object {
+                l.object = Some(Arc::new(crate::object::LayerObject { kind, origin: l.offset }));
+            }
         }
     }
     doc.default_depth = layers.iter().filter(|l| !l.is_filter()).map(|l| l.depth()).max().unwrap_or(Depth::U8);
@@ -679,6 +696,24 @@ mod tests {
             assert!((0..4).all(|i| (p.0[i] - p.1[i]).abs() < 1e-3), "{p:?}");
         }
         assert!((before.get(3, 3)[0] - before.get(0, 0)[0]).abs() > 0.1);
+    }
+
+    #[test]
+    fn object_layers_roundtrip() {
+        use crate::object::ObjectKind;
+        use crate::ops::paint::{Shape, ShapeKind};
+        let mut d = Document::new(40, 30, Depth::U8, Some(Color::WHITE));
+        let shape = Shape { width: 3.0, ..Shape::new(ShapeKind::Ellipse, crate::Vec2::new(5.0, 4.0), crate::Vec2::new(25.0, 20.0)) };
+        let kind = ObjectKind::Shape { shape, color: Color::BLACK, fill_color: Color::WHITE };
+        let (px, off) = kind.render(Depth::U8, None).unwrap();
+        let id = d.add_object_layer(kind, px, off);
+        let seq = d.next_seq();
+        d.layer_mut(id).unwrap().move_to(seq, (off.0 + 7, off.1 + 2));
+        let now = d.layer(id).unwrap().object_now().unwrap();
+        let (bytes, _) = encode(&Snapshot::of(&d)).unwrap();
+        let e = load_bytes(&bytes).unwrap();
+        assert_eq!(e.layers[1].object_now(), Some(now));
+        assert_eq!(e.layers[1].offset, (off.0 + 7, off.1 + 2));
     }
 
     #[test]

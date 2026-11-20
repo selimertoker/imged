@@ -147,7 +147,7 @@ impl GpuFilters {
     fn init_buffer(&self, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
         let b = self.buffer(data.len() as u64, usage | wgpu::BufferUsages::COPY_DST);
         if !data.is_empty() {
-            if data.len() % 4 == 0 {
+            if data.len().is_multiple_of(4) {
                 self.queue.write_buffer(&b, 0, data);
             } else {
                 let mut padded = data.to_vec();
@@ -160,6 +160,7 @@ impl GpuFilters {
 
     /// Runs `passes` (pipeline, workgroups) over the bindings and reads back
     /// `out_bytes` of the output.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         u: Uniforms,

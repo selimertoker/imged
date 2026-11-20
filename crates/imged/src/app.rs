@@ -754,6 +754,9 @@ impl ImgedApp {
                 item(ui, "New layer", Action::Cmd(Command::NewLayer), p);
                 item(ui, "Edit with ImageMagick…", Action::Magick(false), p);
                 item(ui, "Toggle filter layer", Action::ToggleFilterLayer, p);
+                if self.doc.active_layer().object.is_some() {
+                    item(ui, "Rasterize (shape/text to pixels)", Action::Cmd(Command::Rasterize { id: self.doc.active }), p);
+                }
                 item(ui, "Duplicate", Action::Cmd(Command::DuplicateLayer), p);
                 item(ui, "Delete", Action::Cmd(Command::DeleteLayer), p);
                 ui.separator();
@@ -918,17 +921,20 @@ impl ImgedApp {
         use ToolKind::*;
         let k = self.current;
         let s = &mut self.settings;
-        if matches!(k, Brush | Pen | Shape | Bucket | Text) {
+        if matches!(k, Brush | Pen | Bucket) {
             ui.checkbox(&mut s.grow_layers, "Grow layer when painting outside it")
                 .on_hover_text("Off: painting is clipped to the layer's area");
         }
-        if matches!(k, Brush | Pen | Shape | Bucket | Text) {
+        if matches!(k, Brush | Pen | Bucket) {
             ui.checkbox(&mut s.new_layer_on_color, "New layer when the color changes")
                 .on_hover_text("Drawing with a different color than last time starts a new layer");
             ui.checkbox(&mut s.new_layer_on_tool, "New layer when the tool changes")
                 .on_hover_text("Drawing with a different tool than last time starts a new layer");
         }
-        if matches!(k, Brush | Shape | Bucket | Text) {
+        if matches!(k, Shape | Text) {
+            ui.checkbox(&mut s.antialias, "Anti-aliasing").on_hover_text("Smooth edges (off: hard, pixel-exact edges)");
+        }
+        if matches!(k, Brush | Bucket) {
             ui.horizontal(|ui| {
                 ui.label("Paint");
                 egui::ComboBox::from_id_salt("paint-mode").selected_text(s.paint_mode.label()).show_ui(ui, |ui| {

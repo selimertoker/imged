@@ -91,7 +91,7 @@ impl Rect {
 }
 
 /// 2D float point / vector in image pixel coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Vec2 {
     pub x: f32,
     pub y: f32,

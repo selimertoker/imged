@@ -418,8 +418,17 @@ impl Document {
     pub fn structural(&mut self, label: &str, f: impl FnOnce(&mut Document) -> bool) -> bool {
         let before = self.snapshot();
         let seq = self.next_seq();
+        let objects: Vec<(LayerId, *const Pixels)> =
+            self.layers.iter().filter(|l| l.object.is_some()).map(|l| (l.id, Arc::as_ptr(&l.pixels))).collect();
         if !f(self) {
             return false;
+        }
+        // Shape/text layers whose pixels were changed are plain pixels now
+        // (undo restores the snapshot, objects included).
+        for (id, ptr) in objects {
+            if let Some(l) = self.layer_mut(id).filter(|l| Arc::as_ptr(&l.pixels) != ptr) {
+                l.object = None;
+            }
         }
         self.undo.push(DocEntry { seq, label: label.into(), state: before });
         self.redo.clear();
@@ -577,6 +586,60 @@ impl Document {
         let at = if self.layers.is_empty() { 0 } else { self.active_block().end };
         self.active = layer.id;
         self.layers.insert(at, layer);
+    }
+
+    /// Adds a shape or text layer (already rendered: `pixels` at `offset`)
+    /// above the active block, joining the active layer's group.
+    pub fn add_object_layer(&mut self, kind: crate::object::ObjectKind, pixels: Pixels, offset: (i32, i32)) -> LayerId {
+        let id = self.alloc_id();
+        let label = kind.label();
+        let group = self.layers.get(self.active_block().end.saturating_sub(1)).and_then(|l| l.group);
+        self.structural(&label, |d| {
+            let mut l = Layer::new(id, label.clone(), pixels, offset);
+            l.group = group;
+            l.object = Some(std::sync::Arc::new(crate::object::LayerObject { kind, origin: offset }));
+            d.insert_above_active(l);
+            true
+        });
+        id
+    }
+
+    /// Replaces a layer's object (with its new rendering). Repeated edits
+    /// of the same layer with nothing else in between are one undo step.
+    pub fn set_layer_object(&mut self, id: LayerId, kind: crate::object::ObjectKind, pixels: Pixels, offset: (i32, i32)) -> bool {
+        let label = if kind.is_text() { "Edit text" } else { "Edit shape" };
+        let Some(l) = self.layer(id) else { return false };
+        if l.object_now().as_ref() == Some(&kind) {
+            return false;
+        }
+        let top_seq = l.history.top_undo_seq();
+        let seq = match self.next_undo() {
+            Some((seq, false, ref top)) if top == label && top_seq == Some(seq) => seq,
+            _ => self.next_seq(),
+        };
+        self.redo.clear();
+        let l = self.layer_mut(id).unwrap();
+        let old = l.bounds();
+        // A name that was the automatic one follows the object.
+        if l.object.as_ref().is_some_and(|o| o.kind.label() == l.name) {
+            l.name = kind.label();
+        }
+        let obj = crate::object::LayerObject { kind, origin: offset };
+        l.set_object(seq, label, Some(obj), Some((pixels, offset)), true);
+        let new = l.bounds();
+        self.mark_dirty(old.union(&new));
+        true
+    }
+
+    /// Turns a shape or text layer into a plain pixel layer.
+    pub fn rasterize(&mut self, id: LayerId) -> bool {
+        if self.layer(id).is_none_or(|l| l.object.is_none()) {
+            return false;
+        }
+        let seq = self.next_seq();
+        self.redo.clear();
+        self.layer_mut(id).unwrap().set_object(seq, "Rasterize", None, None, false);
+        true
     }
 
     /// Adds an empty canvas-sized layer above the active block.

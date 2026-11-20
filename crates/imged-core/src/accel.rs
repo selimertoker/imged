@@ -72,7 +72,9 @@ pub fn available() -> Option<String> {
     ACCEL.get().map(|a| a.name())
 }
 
-/// Views a channel buffer as [`ImageData`].
+/// Views a channel buffer as [`ImageData`]. (Takes the `Vec` itself: that
+/// is the type the downcast can see.)
+#[allow(clippy::ptr_arg)]
 pub fn data_of<T: Channel>(data: &Vec<T>) -> ImageData<'_> {
     let any = data as &dyn Any;
     if let Some(d) = any.downcast_ref::<Vec<u8>>() {

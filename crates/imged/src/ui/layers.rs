@@ -48,6 +48,8 @@ struct Entry {
     /// A filter layer (single layers only), and what its filter does.
     filter: bool,
     summary: String,
+    /// A shape or text layer (still editable).
+    object: Option<&'static str>,
 }
 
 fn thumbnail(px: &Pixels) -> ColorImage {
@@ -89,6 +91,11 @@ fn entries(doc: &Document) -> Vec<Entry> {
             members: members.iter().map(|l| l.id).collect(),
             filter: group.is_none() && top.is_filter(),
             summary: top.filter.summary(),
+            object: if group.is_some() {
+                None
+            } else {
+                top.object.as_ref().map(|o| if o.kind.is_text() { "text" } else { "shape" })
+            },
         });
         i = block.start;
     }
@@ -375,6 +382,11 @@ impl LayersPanel {
                             e.summary,
                             if e.opacity < 1.0 { format!(" · {:.0}%", e.opacity * 100.0) } else { String::new() }
                         ),
+                        None if e.object.is_some() => format!(
+                            "{} · editable{}",
+                            e.object.unwrap_or_default(),
+                            if e.opacity < 1.0 { format!(" · {:.0}%", e.opacity * 100.0) } else { String::new() }
+                        ),
                         None => format!(
                             "{} · {}×{}{}",
                             e.depth.short(),
@@ -472,6 +484,14 @@ impl LayersPanel {
                 actions.push(Action::Cmd(Command::CropLayerToContent));
             }
             canvas_size_button(ui, actions);
+            if doc.active_layer().object.is_some()
+                && ui
+                    .small_button("Rasterize")
+                    .on_hover_text("Turn this shape/text layer into plain pixels (it can't be edited as a shape/text afterwards)")
+                    .clicked()
+            {
+                actions.push(Action::Cmd(Command::Rasterize { id: doc.active }));
+            }
         });
     }
 

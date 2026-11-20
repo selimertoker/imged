@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::geom::Rect;
+use crate::object::LayerObject;
 use crate::ops::filters::LayerFilter;
 use crate::pixel::Depth;
 use crate::pixels::Pixels;
@@ -35,7 +36,13 @@ pub struct Patch {
     pub seq: u64,
     pub label: String,
     pub kind: PatchKind,
+    /// The layer's object before and after, when it changed (an object
+    /// edit, or a pixel edit that turned an object layer into pixels).
+    pub object: Option<ObjectChange>,
 }
+
+/// (before, after)
+pub type ObjectChange = (Option<Arc<LayerObject>>, Option<Arc<LayerObject>>);
 
 #[derive(Clone, Debug, Default)]
 pub struct LayerHistory {
@@ -71,6 +78,8 @@ pub struct Layer {
     pub filter_on: bool,
     /// The filter layer's settings (kept while `filter_on` is off).
     pub filter: LayerFilter,
+    /// Set for shape and text layers: the pixels are its rendering.
+    pub object: Option<Arc<LayerObject>>,
     pub history: LayerHistory,
 }
 
@@ -86,8 +95,14 @@ impl Layer {
             group: None,
             filter_on: false,
             filter: LayerFilter::default(),
+            object: None,
             history: LayerHistory::default(),
         }
+    }
+
+    /// The object as it is now (geometry following the layer's position).
+    pub fn object_now(&self) -> Option<crate::object::ObjectKind> {
+        self.object.as_ref().map(|o| o.at(self.offset))
     }
 
     pub fn is_filter(&self) -> bool {
@@ -115,7 +130,12 @@ impl Layer {
         Arc::make_mut(&mut self.pixels)
     }
 
-    fn push(&mut self, patch: Patch) {
+    fn push(&mut self, mut patch: Patch) {
+        // A pixel edit turns an object layer into pixels (moves don't).
+        let moved_only = matches!(&patch.kind, PatchKind::Full { before, after } if Arc::ptr_eq(&before.0, &after.0));
+        if patch.object.is_none() && self.object.is_some() && !moved_only {
+            patch.object = Some((self.object.take(), None));
+        }
         self.history.undo.push(Arc::new(patch));
         self.history.redo.clear();
         if self.history.undo.len() > LAYER_HISTORY_LIMIT {
@@ -148,6 +168,7 @@ impl Layer {
             seq,
             label: label.to_string(),
             kind: PatchKind::Region { x: rect.x, y: rect.y, before, after },
+            object: None,
         });
     }
 
@@ -161,6 +182,7 @@ impl Layer {
             seq,
             label: label.to_string(),
             kind: PatchKind::Full { before, after },
+            object: None,
         });
     }
 
@@ -176,6 +198,7 @@ impl Layer {
             seq,
             label: "Move".into(),
             kind: PatchKind::Full { before, after },
+            object: None,
         });
     }
 
@@ -196,6 +219,7 @@ impl Layer {
             seq,
             label: label.to_string(),
             kind: PatchKind::Full { before: before.clone(), after: (self.pixels.clone(), offset) },
+            object: top.object.clone(),
         };
         *self.history.undo.last_mut().unwrap() = Arc::new(patch);
         self.history.redo.clear();
@@ -211,7 +235,46 @@ impl Layer {
         let before = (self.pixels.clone(), self.offset);
         self.offset = offset;
         let after = (self.pixels.clone(), self.offset);
-        self.push(Patch { seq, label: label.to_string(), kind: PatchKind::Full { before, after } });
+        self.push(Patch { seq, label: label.to_string(), kind: PatchKind::Full { before, after }, object: None });
+    }
+
+    /// Sets the layer's object (or removes it with `None`) and its rendered
+    /// pixels, as one history entry. With `merge`, the change is folded
+    /// into the newest entry when it is an object edit with the same label
+    /// and sequence number (e.g. while a slider is dragged).
+    pub fn set_object(
+        &mut self,
+        seq: u64,
+        label: &str,
+        object: Option<LayerObject>,
+        pixels: Option<(Pixels, (i32, i32))>,
+        merge: bool,
+    ) {
+        let object = object.map(Arc::new);
+        let after_px = match pixels {
+            Some((px, off)) => (Arc::new(px), off),
+            None => (self.pixels.clone(), self.offset),
+        };
+        let top = self.history.undo.last().filter(|t| merge && t.seq == seq && t.label == label && t.object.is_some());
+        let (before, before_obj) = match top.map(|t| (&t.kind, &t.object)) {
+            Some((PatchKind::Full { before, .. }, Some((b, _)))) => (before.clone(), b.clone()),
+            _ => ((self.pixels.clone(), self.offset), self.object.clone()),
+        };
+        let patch = Patch {
+            seq,
+            label: label.to_string(),
+            kind: PatchKind::Full { before, after: after_px.clone() },
+            object: Some((before_obj, object.clone())),
+        };
+        if top.is_some() {
+            *self.history.undo.last_mut().unwrap() = Arc::new(patch);
+            self.history.redo.clear();
+        } else {
+            self.push(patch);
+        }
+        self.pixels = after_px.0;
+        self.offset = after_px.1;
+        self.object = object;
     }
 
     /// Undoes the newest entry. Returns the canvas rect that changed.
@@ -230,6 +293,9 @@ impl Layer {
     }
 
     fn apply(&mut self, patch: &Patch, backwards: bool) -> Rect {
+        if let Some((b, a)) = &patch.object {
+            self.object = if backwards { b.clone() } else { a.clone() };
+        }
         match &patch.kind {
             PatchKind::Region { x, y, before, after } => {
                 let src = if backwards { before } else { after };
