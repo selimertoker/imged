@@ -18,6 +18,22 @@ mod view;
 
 use std::path::PathBuf;
 
+/// Asks for everything the GPU supports (eframe's default caps OpenGL at
+/// WebGL 2 limits, without compute shaders, and textures at 8192 px): the
+/// GPU outline select needs compute shaders, the canvas renderer big textures.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{wgpu, WgpuConfiguration, WgpuSetup};
+    let mut c = WgpuConfiguration::default();
+    if let WgpuSetup::CreateNew(new) = &mut c.wgpu_setup {
+        new.device_descriptor = std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
+            label: Some("imged"),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        });
+    }
+    c
+}
+
 fn main() -> eframe::Result {
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
@@ -28,6 +44,7 @@ fn main() -> eframe::Result {
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_drag_and_drop(true),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native("imged", options, Box::new(move |cc| Ok(Box::new(app::ImgedApp::new(cc, files)))))

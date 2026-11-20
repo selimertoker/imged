@@ -246,7 +246,8 @@ impl GpuRenderer {
             mip_layout,
         };
         let limits = device.limits();
-        let align = limits.min_uniform_buffer_offset_alignment.max(std::mem::size_of::<Params>() as u32);
+        // Slots must be multiples of the alignment (not just at least as big).
+        let align = (std::mem::size_of::<Params>() as u32).next_multiple_of(limits.min_uniform_buffer_offset_alignment);
         let params_slots = 64;
         let params = params_buffer(&device, params_slots, align);
         let params_bind = params_bind(&device, &pipes.params_layout, &params);

@@ -647,7 +647,7 @@ pub fn filtered(l: &crate::layer::Layer, f: &Filter, scope: Scope, selection: Op
 fn selection_source<R>(
     doc: &Document,
     sample_merged: bool,
-    f: impl FnOnce(Rect, &dyn Fn(i32, i32) -> crate::pixel::Px) -> Option<R>,
+    f: impl FnOnce(Rect, &(dyn Fn(i32, i32) -> crate::pixel::Px + Sync)) -> Option<R>,
 ) -> Option<R> {
     let domain = if sample_merged { doc.canvas_rect() } else { doc.targets_bounds() };
     if domain.is_empty() {
