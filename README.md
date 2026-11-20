@@ -60,9 +60,9 @@ cargo run --release -p imged -- [image] [more images as layers…]
 | B | Brush | Left click paints the primary color, right click the secondary. Shift+click draws a line from the last stroke. `[` and `]` change the size. |
 | N | Pen | Square, hard, non-antialiased tip that sets pixels to the exact color, alpha included. |
 | I | Color picker | Hovering shows the color under the cursor in the color panel's controls; left click sets the primary, right click the secondary (and makes it the edited color). Can average a square (3×3 up to 101×101). Samples all layers or only the active one. |
-| U | Shapes | Line, rectangle, square, ellipse, circle, arrow (picked by icon). Outline, filled, or outline with a secondary-color fill. Options: rounded corners/ends (sharp by default), pixel-aligned (on by default), draw from center. Shift constrains. Snaps to edges. |
+| U | Shapes | Line, rectangle, square, ellipse, circle, arrow (picked by icon). Outline, filled, or outline with a secondary-color fill. Options: rounded corners/ends (sharp by default), pixel-aligned (on by default), draw from center. Shift constrains. Snaps to edges. Each shape is its own **shape layer** and stays editable (see *Shape and text layers*). |
 | G | Paint bucket | Tolerance, contiguous, diagonal, sample all layers. Hovering previews the area that would be filled, tinted with the paint color. A fill that starts a new layer (the new-layer options) detects the area from the visible image. |
-| T | Text | Choose a system font, size, bold, italic, rotation and line spacing. Click to place the text, drag it to move, press Enter or Apply to commit. Snaps to edges. |
+| T | Text | Choose a system font, size, bold, italic, rotation and line spacing. Click to place the text, drag it to move, press Enter or Apply to commit. Snaps to edges. Each text is its own **text layer** and stays editable. |
 | M | Box select | Selects a box. Snaps to edges. See *Selections*. |
 | W | Magic wand | Selects the clicked color region. Hovering previews it. |
 | O | Outline select | Finds the solid-color outline (or flat background) around the click and selects everything inside it. **Content on a solid background** instead selects the smallest rectangle with only the solid color around the click outside it (e.g. the bounding box of text on a plain background); the outline tolerance decides which colors count as that solid color. Hovering previews the result. |
@@ -120,7 +120,23 @@ The palette's **+** adds the edited color, Ctrl+click replaces a swatch,
 Shift+click removes it, and the palette is remembered. While the color
 picker hovers the canvas, every control shows the color under the cursor.
 
-**New layers while drawing.** The brush, pen, shape, bucket and text tools have
+**Shape and text layers.** Shapes and text are not turned into pixels: each
+one is a layer that remembers what it is (the layer panel says "shape ·
+editable" or "text · editable"). With the shape tool, the active shape layer
+shows handles: drag them (or the shape itself) to change it, and its options
+(kind, line width, style, rounded corners, line and fill colors) change it
+directly. Ctrl+drag, or dragging away from the shape, draws a new one. With
+the text tool, the active text layer is edited as you type or change the
+font, size, rotation or color, and dragging the text moves it. A run of
+edits to the same layer is one undo step, and moving the layer with the
+Move tool keeps it editable. Pixel operations on it (filters, transforms,
+cutting a selection, erasing) turn it into plain pixels, and undo brings
+the shape or text back. The brush, pen and bucket paint on a new layer
+above a shape or text layer instead. **Rasterize** (layer panel, Layer
+menu, or the tool options) turns it into pixels on purpose. Projects keep
+them editable: other programs see their rendered pixels.
+
+**New layers while drawing.** The brush, pen and bucket tools have
 **New layer when the color changes** and **New layer when the tool
 changes**: when on, drawing with a different color (or tool) than the last
 drawing starts a new layer first, and the first drawing always does.
@@ -251,7 +267,12 @@ counts as an edge.
 (with live preview), exposure (in EV stops), a channel switch (e.g. R ↔ G,
 or any channel with alpha), and convolution. The convolution kernel is a text box of
 comma-separated rows that you can paste into; fractions like `1/16` work and
-the numbers are re-aligned in columns when you leave the box. **Alpha** goes
+the numbers are re-aligned in columns when you leave the box. Its presets
+follow the selected size (3×3 to 9×9): box blur, Gaussian blur, motion blur,
+**low pass** (a windowed sinc cutting off at half the Nyquist frequency) and
+**high pass** (the image minus its low pass, around mid-gray, so flat areas
+turn gray and details stand out), plus sharpen, edge detect, emboss and
+Sobel. **Alpha** goes
 from -100% to +100% and is added to every pixel's opacity: +100% removes
 transparency (everything becomes opaque), -100% makes everything
 transparent. Filters follow the Transform
@@ -289,6 +310,27 @@ checks they match within 1–3 levels out of 255. **View → GPU rendering**
 (remembered) switches back to the CPU renderer, whose 512 px tiles are
 re-composited where the image changed.
 
+## GPU filters
+
+Convolution and resizing (the Resize tool, Image → Resize, and the scaling
+done by transforms) run as compute shaders on the GPU (`gpu_filters.rs`,
+`gpu_filters.wgsl`). These are the operations that do enough work per pixel
+to be worth sending the pixels to the graphics card and back: a 9×9 kernel
+is 81 multiply-adds per channel per pixel. Pixels are sent in their own
+depth (8-bit images as 4 bytes per pixel), and the results match the CPU's
+within one 8-bit level (a test checks every preset, edge mode and resize
+filter at all three depths).
+
+The core library stays GPU-free: `imged_core::accel` is a small hook that
+the GUI registers the GPU implementation with. Every operation keeps its CPU
+code (`convolve_cpu`, `resize_cpu`), used when there is no GPU, when the
+image is larger than the device's buffer limits, and by a future CLI.
+**View → GPU filters** (remembered) switches it off to compare.
+
+Per-pixel color filters, flips, rotations and warps stay on the CPU. They do
+so little work per pixel that copying the image to the GPU and back would
+take longer than running them on all CPU cores.
+
 ## Architecture
 
 ```
@@ -297,7 +339,9 @@ crates/
     pixel.rs      Channel trait (u8/u16/f32), Depth, alpha math
     buffer.rs     Buffer<T: Channel>, generic pixel storage
     pixels.rs     Pixels enum (runtime depth) + dispatch!/map_pixels! macros
-    layer.rs      Layer, per-layer pixel patches (region / full)
+    layer.rs      Layer, per-layer pixel patches (region / full; object changes)
+    object.rs     shape and text layers: the object and its rendering
+    accel.rs      hook for accelerators (GPU convolution / resize), CPU fallback
     document.rs   layer stack, groups, structural snapshots, global undo timeline
     composite.rs  CPU compositor (LayerView list → f32 buffer)
     command.rs    Command enum: the single entry point for edits
@@ -315,6 +359,7 @@ crates/
     actions.rs    Action enum, Chord, KeyResolver trait, default Keymap
     renderer.rs   CanvasRenderer trait, CpuTiledRenderer (512 px tiles, dirty rects)
     renderer_gpu.rs, gpu.wgsl   GpuRenderer: layers as wgpu textures, composited in a shader
+    gpu_filters.rs, gpu_filters.wgsl   compute-shader convolution and resize (imged_core::accel)
     tools/        Tool trait + one module per tool; LivePaint previews
     ui/           color, layers, filters panels, dialogs, widgets (painted icons),
                   ants (marching-ants selection outline)
@@ -346,10 +391,9 @@ layer pixels and history patches are `Arc`-shared (copy-on-write).
   first.
 
 * **GPU acceleration.** The canvas is composited on the GPU (see *GPU
-  rendering*). Heavy operations are all `Command` variants (filters,
-  convolution, resize, warps), so a GPU executor can intercept the ones it
-  accelerates and fall back to the CPU for the rest; the renderer's
-  textures and shaders are a starting point.
+  rendering*), and convolution and resizing run there (see *GPU filters*).
+  More operations can be added to the `imged_core::accel::Accelerator`
+  trait the same way; each keeps its CPU version as the fallback.
 
 * **Clipboard.** Text boxes use egui's clipboard support (Ctrl+C/X/V, plus the
   PRIMARY selection on Linux: select to copy, middle-click to paste).
@@ -370,7 +414,8 @@ layer pixels and history patches are `Arc`-shared (copy-on-write).
 * Painting tools don't clip to the selection yet; the selection is used by
   filters, transforms, cutting/copying and cropping.
 * Thumbnails refresh about three times a second during edits.
-* Edits themselves (filters, transforms, painting) and exports still run on
-  the CPU; only displaying the canvas is GPU-accelerated.
+* Besides displaying the canvas, only convolution and resizing run on the
+  GPU; other edits and exports run on the CPU.
+* Images bigger than the GPU's buffer limits are filtered on the CPU.
 * Canvases or layers larger than the GPU's texture limit (usually 8192 or
   16384 px) are displayed with the CPU renderer.
