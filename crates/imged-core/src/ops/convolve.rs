@@ -72,17 +72,53 @@ impl Kernel {
         Kernel { size, weights: out, ..self.clone() }
     }
 
-    pub fn presets() -> Vec<(&'static str, Kernel)> {
-        let gauss5 = {
-            let r = [1.0, 4.0, 6.0, 4.0, 1.0];
-            let mut w = Vec::with_capacity(25);
-            for a in r {
-                for b in r {
-                    w.push(a * b);
-                }
+    /// Separable kernel: the outer product of a row of weights with itself.
+    fn separable(row: &[f32]) -> Kernel {
+        let w = row.iter().flat_map(|a| row.iter().map(move |b| a * b)).collect();
+        Kernel::from_weights(row.len(), w)
+    }
+
+    /// Low-pass row: a Hann-windowed sinc with its cutoff at half the
+    /// Nyquist frequency (a quarter cycle per pixel), scaled so the center
+    /// is 100 and rounded, so the kernel text stays readable.
+    fn low_pass_row(size: usize) -> Vec<f32> {
+        let r = (size / 2) as f32;
+        let fc = 0.25f32;
+        (0..size)
+            .map(|i| {
+                let n = i as f32 - r;
+                let sinc = if n == 0.0 { 1.0 } else { (std::f32::consts::PI * 2.0 * fc * n).sin() / (std::f32::consts::PI * 2.0 * fc * n) };
+                let window = 0.5 * (1.0 + (std::f32::consts::PI * n / (r + 1.0)).cos());
+                (100.0 * sinc * window).round()
+            })
+            .collect()
+    }
+
+    /// The presets for kernels of `size`×`size`. Blurs and the frequency
+    /// filters use the whole size; the classic 3×3 ones are padded.
+    pub fn presets(size: usize) -> Vec<(String, Kernel)> {
+        let size = size.max(3) | 1;
+        // Binomial coefficients approximate a Gaussian.
+        let mut binomial = vec![1.0f32];
+        for _ in 1..size {
+            let mut next = vec![1.0; binomial.len() + 1];
+            for i in 1..binomial.len() {
+                next[i] = binomial[i - 1] + binomial[i];
             }
-            Kernel::from_weights(5, w)
-        };
+            binomial = next;
+        }
+        let low = Kernel::separable(&Kernel::low_pass_row(size));
+        // High pass = identity - low pass, around mid-gray (like the usual
+        // "High pass" filter): flat areas turn gray, details stand out.
+        let sum: f32 = low.weights.iter().sum();
+        let mut high = Kernel::identity(size);
+        for (h, l) in high.weights.iter_mut().zip(&low.weights) {
+            *h = *h * sum - l;
+        }
+        high.divisor = sum;
+        high.bias = 0.5;
+        high.include_alpha = false;
+
         let mut edge = Kernel::from_weights(3, vec![-1., -1., -1., -1., 8., -1., -1., -1., -1.]);
         edge.include_alpha = false;
         let mut emboss = Kernel::from_weights(3, vec![-2., -1., 0., -1., 1., 1., 0., 1., 2.]);
@@ -93,27 +129,44 @@ impl Kernel {
         let mut sobel_y = Kernel::from_weights(3, vec![-1., -2., -1., 0., 0., 0., 1., 2., 1.]);
         sobel_y.include_alpha = false;
         sobel_y.bias = 0.5;
+        let n = size;
+        let sized = |name: &str| format!("{name} {n}×{n}");
         vec![
-            ("Identity", Kernel::identity(3)),
-            ("Box blur 3×3", Kernel::from_weights(3, vec![1.0; 9])),
-            ("Box blur 5×5", Kernel::from_weights(5, vec![1.0; 25])),
-            ("Gaussian 3×3", Kernel::from_weights(3, vec![1., 2., 1., 2., 4., 2., 1., 2., 1.])),
-            ("Gaussian 5×5", gauss5),
-            ("Sharpen", Kernel::from_weights(3, vec![0., -1., 0., -1., 5., -1., 0., -1., 0.])),
-            ("Strong sharpen", Kernel::from_weights(3, vec![-1., -1., -1., -1., 9., -1., -1., -1., -1.])),
-            ("Edge detect", edge),
-            ("Emboss", emboss),
-            ("Sobel X", sobel_x),
-            ("Sobel Y", sobel_y),
+            ("Identity".into(), Kernel::identity(size)),
+            (sized("Box blur"), Kernel::from_weights(size, vec![1.0; size * size])),
+            (sized("Gaussian blur"), Kernel::separable(&binomial)),
             (
-                "Motion blur",
-                Kernel::from_weights(5, (0..25).map(|i| if i % 6 == 0 { 1.0 } else { 0.0 }).collect()),
+                sized("Motion blur"),
+                Kernel::from_weights(size, (0..size * size).map(|i| if i % (size + 1) == 0 { 1.0 } else { 0.0 }).collect()),
             ),
+            (sized("Low pass"), low),
+            (sized("High pass"), high),
+            ("Sharpen".into(), Kernel::from_weights(3, vec![0., -1., 0., -1., 5., -1., 0., -1., 0.]).resized(size)),
+            ("Strong sharpen".into(), Kernel::from_weights(3, vec![-1., -1., -1., -1., 9., -1., -1., -1., -1.]).resized(size)),
+            ("Edge detect".into(), edge.resized(size)),
+            ("Emboss".into(), emboss.resized(size)),
+            ("Sobel X".into(), sobel_x.resized(size)),
+            ("Sobel Y".into(), sobel_y.resized(size)),
         ]
     }
 }
 
 pub fn convolve<T: Channel>(src: &Buffer<T>, k: &Kernel) -> Buffer<T> {
+    let (w, h) = (src.width as i32, src.height as i32);
+    if w == 0 || h == 0 || k.size == 0 {
+        return src.clone();
+    }
+    if let Some(a) = crate::accel::get() {
+        let out = a.convolve(src.width, src.height, crate::accel::data_of(&src.data), k).and_then(crate::accel::out_as::<T>);
+        if let Some(data) = out.filter(|d| d.len() == src.data.len()) {
+            return Buffer { width: src.width, height: src.height, data };
+        }
+    }
+    convolve_cpu(src, k)
+}
+
+/// [`convolve`] on the CPU (the reference for accelerators).
+pub fn convolve_cpu<T: Channel>(src: &Buffer<T>, k: &Kernel) -> Buffer<T> {
     let (w, h) = (src.width as i32, src.height as i32);
     if w == 0 || h == 0 || k.size == 0 {
         return src.clone();
@@ -194,6 +247,27 @@ pub fn convolve<T: Channel>(src: &Buffer<T>, k: &Kernel) -> Buffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_follow_the_size() {
+        for size in [3, 5, 7, 9] {
+            for (name, k) in Kernel::presets(size) {
+                assert_eq!(k.size, size, "{name}");
+                assert_eq!(k.weights.len(), size * size, "{name}");
+            }
+        }
+        // On a flat image: low pass keeps it, high pass gives mid-gray.
+        let flat = Buffer::<f32>::filled(12, 12, [0.3, 0.6, 0.9, 1.0]);
+        let presets = Kernel::presets(7);
+        let get = |n: &str| presets.iter().find(|(name, _)| name.starts_with(n)).unwrap().1.clone();
+        let low = convolve(&flat, &get("Low pass")).get(6, 6);
+        let high = convolve(&flat, &get("High pass")).get(6, 6);
+        for c in 0..3 {
+            assert!((low[c] - [0.3, 0.6, 0.9][c]).abs() < 1e-4, "{low:?}");
+            assert!((high[c] - 0.5).abs() < 1e-4, "{high:?}");
+        }
+        assert_eq!(get("Box blur").weights, vec![1.0; 49]);
+    }
 
     #[test]
     fn identity_is_noop() {

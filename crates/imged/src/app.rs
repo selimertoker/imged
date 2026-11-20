@@ -65,6 +65,8 @@ pub struct ImgedApp {
     gpu_state: Option<eframe::egui_wgpu::RenderState>,
     /// View → "GPU rendering" (remembered).
     use_gpu: bool,
+    /// View → "GPU filters" (remembered): convolution and resizing on the GPU.
+    gpu_filters: bool,
     /// Whether `renderer` is the GPU one.
     renderer_is_gpu: bool,
     checker: Option<TextureHandle>,
@@ -121,9 +123,10 @@ impl ImgedApp {
             last_canvas_rect: egui::Rect::NOTHING,
             last_doc_size: (0, 0),
             renderer: Box::new(CpuTiledRenderer::default()),
-            gpu_state: cc.wgpu_render_state.clone(),
+            gpu_state: cc.wgpu_render_state.clone().inspect(crate::gpu_filters::register),
             use_gpu: std::env::var("IMGED_RENDERER").map_or(true, |v| !v.eq_ignore_ascii_case("cpu")),
             renderer_is_gpu: false,
+            gpu_filters: true,
             checker: None,
             tools: create_tools(),
             current: ToolKind::Brush,
@@ -178,6 +181,7 @@ impl ImgedApp {
             ("new_layer_on_tool", &mut s.new_layer_on_tool),
             ("checkerboard", &mut self.display.checkerboard),
             ("gpu_rendering", &mut self.use_gpu),
+            ("gpu_filters", &mut self.gpu_filters),
         ] {
             p.bool(load, key, v);
         }
@@ -200,6 +204,7 @@ impl ImgedApp {
 
     /// Switches between the GPU and CPU canvas renderers (View → GPU rendering).
     fn update_renderer(&mut self) {
+        imged_core::accel::set_enabled(self.gpu_filters);
         let want = self.use_gpu && self.gpu_state.is_some();
         if want == self.renderer_is_gpu {
             return;
@@ -795,6 +800,19 @@ impl ImgedApp {
                 ui.add_enabled(self.gpu_state.is_some(), egui::Checkbox::new(&mut self.use_gpu, "GPU rendering"))
                     .on_hover_text(tip)
                     .on_disabled_hover_text("Not available: the window isn't drawn with wgpu");
+                let accel = imged_core::accel::available();
+                let tip = format!(
+                    "Run convolution and resizing on the graphics card (off: on the processor)\n{}",
+                    accel.as_deref().unwrap_or("")
+                );
+                if ui
+                    .add_enabled(accel.is_some(), egui::Checkbox::new(&mut self.gpu_filters, "GPU filters"))
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text("Not available: the graphics card can't run compute shaders")
+                    .changed()
+                {
+                    imged_core::accel::set_enabled(self.gpu_filters);
+                }
             });
             ui.menu_button("Help", |ui| {
                 item(ui, "Keyboard shortcuts", Action::ShowDialog(Dialog::Keys), p);

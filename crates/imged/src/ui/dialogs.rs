@@ -207,7 +207,7 @@ impl ConvolutionDialog {
         dialog_window(ctx, "Convolution").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 egui::ComboBox::from_label("Preset").selected_text("Choose…").show_ui(ui, |ui| {
-                    for (name, k) in Kernel::presets() {
+                    for (name, k) in Kernel::presets(self.kernel.size) {
                         if ui.selectable_label(false, name).clicked() {
                             self.kernel = k;
                             self.auto_divisor = (self.kernel.divisor - self.kernel.auto_divisor()).abs() < 1e-6;

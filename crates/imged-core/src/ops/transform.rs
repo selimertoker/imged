@@ -180,6 +180,34 @@ pub fn resize<T: Channel>(b: &Buffer<T>, nw: u32, nh: u32, filter: ResizeFilter)
             b.get(px, py)
         });
     }
+    if let Some(a) = crate::accel::get() {
+        let pack = |ws: Vec<(usize, Vec<f32>)>| {
+            let mut aw = crate::accel::AxisWeights { starts: Vec::new(), offsets: vec![0], weights: Vec::new() };
+            for (lo, w) in ws {
+                aw.starts.push(lo as u32);
+                aw.weights.extend(w);
+                aw.offsets.push(aw.weights.len() as u32);
+            }
+            aw
+        };
+        let horiz = pack(axis_weights(b.width as usize, nw as usize, filter));
+        let vert = pack(axis_weights(b.height as usize, nh as usize, filter));
+        let out = a
+            .resize(b.width, b.height, crate::accel::data_of(&b.data), &horiz, &vert)
+            .and_then(crate::accel::out_as::<T>);
+        if let Some(data) = out.filter(|d| d.len() == nw as usize * nh as usize * 4) {
+            return Buffer { width: nw, height: nh, data };
+        }
+    }
+    resize_cpu(b, nw, nh, filter)
+}
+
+/// [`resize`] on the CPU (the reference for accelerators).
+pub fn resize_cpu<T: Channel>(b: &Buffer<T>, nw: u32, nh: u32, filter: ResizeFilter) -> Buffer<T> {
+    let (nw, nh) = (nw.max(1), nh.max(1));
+    if b.width == 0 || b.height == 0 {
+        return Buffer::new(nw, nh);
+    }
     let src: Vec<[f32; 4]> = b
         .data
         .par_chunks(4)
@@ -200,7 +228,7 @@ pub fn resize<T: Channel>(b: &Buffer<T>, nw: u32, nh: u32, filter: ResizeFilter)
 }
 
 /// Weights for each output coordinate: (first source index, weights).
-fn axis_weights(src_len: usize, dst_len: usize, filter: ResizeFilter) -> Vec<(usize, Vec<f32>)> {
+pub fn axis_weights(src_len: usize, dst_len: usize, filter: ResizeFilter) -> Vec<(usize, Vec<f32>)> {
     let scale = src_len as f32 / dst_len as f32;
     let fscale = scale.max(1.0); // widen the filter when downscaling
     let support = filter.support() * fscale;

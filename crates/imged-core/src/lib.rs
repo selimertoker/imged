@@ -13,6 +13,7 @@
 //!   point that GUI buttons, keybindings and (later) the CLI all go through.
 //! * [`io`] — loading and saving, including PFM.
 
+pub mod accel;
 pub mod buffer;
 pub mod color;
 pub mod command;

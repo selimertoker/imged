@@ -11,6 +11,7 @@ mod persist;
 mod project;
 mod renderer;
 mod renderer_gpu;
+mod gpu_filters;
 mod state;
 mod tools;
 mod ui;

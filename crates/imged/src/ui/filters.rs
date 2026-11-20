@@ -139,7 +139,7 @@ impl FiltersPanel {
             {
                 actions.push(Action::Filter(Filter::AutoLevels));
             }
-            if ui.button("Convolution…").on_hover_text("Custom kernel filter (Ctrl+K)").clicked() {
+            if ui.button("Convolution").on_hover_text("Custom kernel filter (Ctrl+K)").clicked() {
                 actions.push(Action::ShowDialog(Dialog::Convolution));
             }
         });
@@ -204,7 +204,7 @@ impl FiltersPanel {
                 f.levels = if f.levels.is_some() { None } else { doc.luma_range_below(id) };
                 commit_now = true;
             }
-            ui.add_enabled(false, egui::Button::new("Convolution…"))
+            ui.add_enabled(false, egui::Button::new("Convolution"))
                 .on_disabled_hover_text("Convolution can't be used on a filter layer (it needs neighboring pixels)");
         });
         let (changed, held) = sliders(ui, &mut f.adjust);
