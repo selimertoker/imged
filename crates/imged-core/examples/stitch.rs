@@ -26,7 +26,10 @@ fn main() -> Result<(), String> {
     let moving = io::load(Path::new(pos[1]))?.pixels;
     println!("loaded {}x{} and {}x{} in {:.1}s", fixed.width(), fixed.height(), moving.width(), moving.height(), t.elapsed().as_secs_f32());
     let mode = if flags.iter().any(|f| *f == "--projection") { StitchMode::Projection } else { StitchMode::Board };
-    let progress = |f: f32, s: &str| println!("  [{:3.0}%] {s} ({:.1}s)", f * 100.0, t.elapsed().as_secs_f32());
+    let progress = |f: f32, s: &str| {
+        println!("  [{:3.0}%] {s} ({:.1}s)", f * 100.0, t.elapsed().as_secs_f32());
+        true
+    };
     let al = stitch::align(&fixed, &moving, [num(pos[2])?, num(pos[3])?], [num(pos[4])?, num(pos[5])?], mode, &progress)?;
     println!(
         "aligned: angle {:.1}°, scale {:.3}, seed match {:.0}%, {} matches, median error {:.2} px, field up to {:.1} px",

@@ -41,7 +41,7 @@ cargo run --release -p imged -- [image] [more images as layers…]
   sample type (8/16/32-bit integer, 32/64-bit float, either endianness),
   size, header bytes, row padding, planar storage and row order. A live
   preview and the sizes that fit the file exactly are shown.
-* **Stitching photos** (the Stitch tool) needs the system **OpenCV 4.x**
+* **Stitching photos** (the Stitch tool) needs the system **OpenCV 4.5 or newer**
   development files and **libclang**: build with `--features stitch`, e.g.
   `cargo run --release -p imged --features stitch`. Packages:
   `libopencv-dev clang libclang-dev` (Debian/Ubuntu), `opencv-devel clang-devel`

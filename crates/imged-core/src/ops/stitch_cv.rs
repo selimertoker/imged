@@ -3,7 +3,7 @@
 //!
 //! Only `*_def` OpenCV functions (required arguments only) are used where
 //! the full signature changed between OpenCV versions, so this builds
-//! against any OpenCV 4.x.
+//! against any OpenCV from 4.5 on (USAC needs 4.5, SIFT in features2d 4.4).
 
 use opencv::core::{self, KeyPoint, Mat, Point, Point2f, Scalar, Size, Vec2f, Vector};
 use opencv::prelude::*;
@@ -14,6 +14,15 @@ use super::*;
 use crate::geom::Rect;
 
 type R<T> = Result<T, String>;
+
+/// Reports progress; stops with [`CANCELLED`] when asked to.
+fn step(progress: Progress, f: f32, what: &str) -> R<()> {
+    if progress(f, what) {
+        Ok(())
+    } else {
+        Err(CANCELLED.into())
+    }
+}
 
 trait Cv<T> {
     fn cv(self) -> R<T>;
@@ -398,7 +407,7 @@ pub(super) fn align(
     mode: StitchMode,
     progress: Progress,
 ) -> R<Alignment> {
-    progress(0.02, "Preparing the images");
+    step(progress, 0.02, "Preparing the images")?;
     let (ga_full, gb_full) = rayon::join(|| gray_of(fixed), || gray_of(moving));
     let sa = (WORK / ga_full.w.max(ga_full.h) as f32).min(1.0);
     let sb = (WORK / gb_full.w.max(gb_full.h) as f32).min(1.0);
@@ -411,7 +420,7 @@ pub(super) fn align(
     // Projected document: find the projected area on both photos.
     let (mut quad_a, mut quad_b) = (None, None);
     if mode == StitchMode::Projection {
-        progress(0.08, "Finding the projected area");
+        step(progress, 0.08, "Finding the projected area")?;
         quad_a = find_projection(&ra, pa0)?;
         quad_b = find_projection(&rb, pb0)?;
         if quad_a.is_none() || quad_b.is_none() {
@@ -419,7 +428,7 @@ pub(super) fn align(
         }
     }
 
-    progress(0.12, "Matching the clicked letters");
+    step(progress, 0.12, "Matching the clicked letters")?;
     let sn = snap(&ga, &gb, pa0, pb0)?;
     if sn.score < 0.3 {
         return Err(format!(
@@ -430,7 +439,7 @@ pub(super) fn align(
     let s = sim(sn.angle, sn.scale, pb0, sn.at);
     let mut h = Homography([s[0], s[1], s[2], s[3], s[4], s[5], 0.0, 0.0, 1.0]);
 
-    progress(0.2, "Finding features");
+    step(progress, 0.2, "Finding features")?;
     // In projection mode, leave out the edges of the projected area: they
     // stay put while the document moves.
     let mask_a = quad_a.map(|q| quad_mask(ga.w, ga.h, &shrink_quad(&q, 0.94))).transpose()?;
@@ -442,7 +451,7 @@ pub(super) fn align(
     }
     let grid = PointGrid::new(&fa.pts, ga.w, ga.h, 24.0);
 
-    progress(0.55, "Matching outward from the clicked letters");
+    step(progress, 0.55, "Matching outward from the clicked letters")?;
     let diag = (ga.w as f32).hypot(ga.h as f32);
     let (mut r, mut tol) = (diag * 0.06, diag * 0.02);
     let mut fitted = false;
@@ -469,7 +478,7 @@ pub(super) fn align(
         return Err("Could not find matching letters around the clicked point".into());
     }
 
-    progress(0.75, "Fitting the residual field");
+    step(progress, 0.75, "Fitting the residual field")?;
     // Final matches over the whole image, kept where they agree with their neighbors.
     let all: Vec<usize> = (0..fb.pts.len()).collect();
     let pairs = guided(&h, &fa, &fb, &grid, &all, 6.0);
@@ -535,6 +544,7 @@ pub(super) fn align(
 
     // Full-resolution homography: fixed = S_a^-1 · h · S_b.
     let hf = Homography::scale(inv as f64, inv as f64).mul(&h).mul(&Homography::scale(sb as f64, sb as f64));
+    check_plausible(&hf, moving.width(), moving.height())?;
     let matches: Vec<([f32; 2], [f32; 2])> =
         good.iter().map(|&k| ([dst[k][0] * inv, dst[k][1] * inv], [fb.pts[pairs[k].0][0] / sb, fb.pts[pairs[k].0][1] / sb])).collect();
     let al = Alignment {
@@ -557,8 +567,28 @@ pub(super) fn align(
         .collect();
     errs.sort_by(f32::total_cmp);
     let residual = errs.get(errs.len() / 2).copied().unwrap_or(0.0);
-    progress(1.0, "Aligned");
+    step(progress, 1.0, "Aligned")?;
     Ok(Alignment { residual, ..al })
+}
+
+/// Rejects fits that put part of the moving photo behind the horizon or
+/// stretch it extremely (a bad fit from clustered matches extrapolates like
+/// that, and the warped image would be huge and meaningless).
+fn check_plausible(h: &Homography, w: u32, ht: u32) -> R<()> {
+    let m = &h.0;
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for j in 0..=8 {
+        for i in 0..=8 {
+            let (x, y) = (w as f64 * i as f64 / 8.0, ht as f64 * j as f64 / 8.0);
+            let wv = m[6] * x + m[7] * y + m[8];
+            lo = lo.min(wv);
+            hi = hi.max(wv);
+        }
+    }
+    if lo <= 0.0 || lo / hi < 0.15 {
+        return Err("The alignment came out implausibly stretched. Click a letter nearer the middle of the overlap, or check that it is the same letter on both photos.".into());
+    }
+    Ok(())
 }
 
 // ----- merge ---------------------------------------------------------------
@@ -584,13 +614,16 @@ impl Background {
                     for y in sy * 4..(sy * 4 + 4).min(h) {
                         for x in sx * 4..(sx * 4 + 4).min(w) {
                             let i = y * w + x;
-                            s += if valid[i] { rgb[i][c] } else { 0.0 };
-                            n += 1.0;
+                            if valid[i] {
+                                s += rgb[i][c];
+                                n += 1.0;
+                            }
                         }
                     }
-                    *v = s / n;
+                    *v = if n > 0.0 { s / n } else { f32::NAN };
                 }
             });
+            fill_holes(&mut small);
             let closed = morph(&small, imgproc::MORPH_CLOSE, kk)?;
             *plane = blur(&closed, kk as f32 / 2.0)?.d;
         }
@@ -615,6 +648,45 @@ impl Background {
     }
 }
 
+/// Replaces NaN cells (no valid pixels) by spreading their valid
+/// neighbors outward, so invalid areas don't darken the background near them.
+fn fill_holes(g: &mut FImg) {
+    let (w, h) = (g.w, g.h);
+    for _ in 0..64 {
+        let src = g.d.clone();
+        let mut left = false;
+        for y in 0..h {
+            for x in 0..w {
+                if !src[y * w + x].is_nan() {
+                    continue;
+                }
+                let (mut s, mut n) = (0.0, 0.0);
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                        let v = src[ny as usize * w + nx as usize];
+                        if !v.is_nan() {
+                            s += v;
+                            n += 1.0;
+                        }
+                    }
+                }
+                if n > 0.0 {
+                    g.d[y * w + x] = s / n;
+                } else {
+                    left = true;
+                }
+            }
+        }
+        if !left {
+            return;
+        }
+    }
+    let valid: Vec<f32> = g.d.iter().copied().filter(|v| !v.is_nan()).collect();
+    let mean = if valid.is_empty() { 0.0 } else { valid.iter().sum::<f32>() / valid.len() as f32 };
+    g.d.iter_mut().filter(|v| v.is_nan()).for_each(|v| *v = mean);
+}
+
 /// Darkest channel of the color divided by the background, 0..255 (255 =
 /// empty board or not valid).
 fn reflectance_min(rgb: &[[f32; 3]], valid: &[bool], bg: &Background, w: usize, h: usize) -> Gray {
@@ -636,6 +708,9 @@ fn reflectance_min(rgb: &[[f32; 3]], valid: &[bool], bg: &Background, w: usize, 
 /// smoothed and trusted only near ink, as a field in fixed-layer coordinates.
 fn dense_flow(a: &Gray, b: &Gray, both: &[bool], rect: Rect) -> R<Field> {
     let (hw, hh) = (a.w.div_ceil(2), a.h.div_ceil(2));
+    if hw < 16 || hh < 16 {
+        return Ok(Field::default()); // too small to refine; no correction
+    }
     let (a2, b2) = (resize(a, hw, hh, imgproc::INTER_AREA)?, resize(b, hw, hh, imgproc::INTER_AREA)?);
     let mut dis = video::DISOpticalFlow::create(video::DISOpticalFlow_PRESET_MEDIUM).cv()?;
     let mut flow = Mat::default();
@@ -716,9 +791,12 @@ pub(super) fn merge(fixed: &Pixels, moving: &Pixels, al: &Alignment, opt: MergeO
     let mq = al.quad_moving.unwrap_or_else(|| rect_quad(moving.width(), moving.height()));
     let big = fw.max(fh) as i32;
     let limit = Rect::from_corners(-3 * big / 2, -3 * big / 2, fw as i32 + 3 * big / 2, fh as i32 + 3 * big / 2);
-    let warped_area = bbox(outline(mq).into_iter().filter_map(|p| al.forward(p[0], p[1])))
-        .ok_or("The aligned layer lands outside the image")?
-        .intersect(&limit);
+    let edge: Vec<[f32; 2]> = outline(mq)
+        .into_iter()
+        .map(|p| al.forward(p[0], p[1]).map(|q| q.map(|v| v.clamp(-1e7, 1e7))))
+        .collect::<Option<_>>()
+        .ok_or("The alignment puts part of the photo behind the horizon; try aligning again from another letter")?;
+    let warped_area = bbox(edge.into_iter()).ok_or("The aligned layer lands outside the image")?.intersect(&limit);
     let canvas = fixed_area.union(&warped_area);
     let ov = fixed_area.intersect(&warped_area);
     if ov.is_empty() {
@@ -729,27 +807,27 @@ pub(super) fn merge(fixed: &Pixels, moving: &Pixels, al: &Alignment, opt: MergeO
     let (w, h) = (o.w as usize, o.h as usize);
     let k = ((fw.max(fh) / 120).max(15)) as i32 | 1;
 
-    progress(0.05, "Warping");
+    step(progress, 0.05, "Warping")?;
     let ((argb, ava), (brgb0, bva0)) = rayon::join(|| read_fixed(fixed, &map, o), || read_warped(moving, &map, o));
-    progress(0.25, "Lighting");
+    step(progress, 0.25, "Lighting")?;
     let bga = Background::new(&argb, &ava, w, h, k)?;
     let rmin_a = reflectance_min(&argb, &ava, &bga, w, h);
     {
         let bgb0 = Background::new(&brgb0, &bva0, w, h, k)?;
         let rmin_b0 = reflectance_min(&brgb0, &bva0, &bgb0, w, h);
         let both: Vec<bool> = ava.iter().zip(&bva0).map(|(a, b)| *a && *b).collect();
-        progress(0.35, "Refining the alignment");
+        step(progress, 0.35, "Refining the alignment")?;
         map.flow = Some(dense_flow(&rmin_a, &rmin_b0, &both, o)?);
     }
     drop((brgb0, bva0));
-    progress(0.5, "Warping");
+    step(progress, 0.5, "Warping")?;
     let (brgb, bva) = read_warped(moving, &map, o);
     let bgb = Background::new(&brgb, &bva, w, h, k)?;
     let rmin_b = reflectance_min(&brgb, &bva, &bgb, w, h);
     let both: Vec<bool> = ava.iter().zip(&bva).map(|(a, b)| *a && *b).collect();
 
     // ---- where the photos disagree
-    progress(0.65, "Comparing the photos");
+    step(progress, 0.65, "Comparing the photos")?;
     let (strong, weak) = ((0.70 * 255.0) as u8, (0.88 * 255.0) as u8);
     let board: Vec<bool> = (0..w * h)
         .into_par_iter()
@@ -791,7 +869,7 @@ pub(super) fn merge(fixed: &Pixels, moving: &Pixels, al: &Alignment, opt: MergeO
     drop((creg, sel));
 
     // ---- feathering across the overlap
-    progress(0.75, "Blending");
+    step(progress, 0.75, "Blending")?;
     let dist = |v: &[bool]| -> R<FImg> {
         let g = Gray { w, h, d: v.iter().map(|&b| b as u8 * 255).collect() };
         let mut out = Mat::default();
@@ -822,7 +900,7 @@ pub(super) fn merge(fixed: &Pixels, moving: &Pixels, al: &Alignment, opt: MergeO
     drop(brgb);
     let blend = OverlapBlend { rect: o, rgb, used };
 
-    progress(0.85, "Rendering");
+    step(progress, 0.85, "Rendering")?;
     let depth = fixed.depth().max(moving.depth());
     let merged = render_merged(fixed, moving, &map, &blend, canvas, depth);
     drop(blend);
@@ -830,6 +908,6 @@ pub(super) fn merge(fixed: &Pixels, moving: &Pixels, al: &Alignment, opt: MergeO
         let r = warped_area.intersect(&canvas);
         (render_warped(moving, &map, r), r)
     });
-    progress(1.0, "Done");
+    step(progress, 1.0, "Done")?;
     Ok(StitchOutput { merged, merged_rect: canvas, warped, conflicts })
 }

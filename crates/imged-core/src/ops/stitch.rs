@@ -113,10 +113,6 @@ impl Homography {
         for i in 0..9 {
             r[i] = inv[i] / det;
         }
-        // Keep w positive for points in front of the camera.
-        if r[8] < 0.0 {
-            r.iter_mut().for_each(|v| *v = -*v);
-        }
         Some(Homography(r))
     }
 
@@ -221,8 +217,13 @@ pub struct StitchOutput {
     pub conflicts: usize,
 }
 
-/// Progress callback: (fraction 0..1, what is happening).
-pub type Progress<'a> = &'a (dyn Fn(f32, &str) + Sync);
+/// Progress callback: (fraction 0..1, what is happening). Returning `false`
+/// cancels the work at the next step ([`align`] and [`merge`] then return
+/// [`CANCELLED`]).
+pub type Progress<'a> = &'a (dyn Fn(f32, &str) -> bool + Sync);
+
+/// The error returned when the progress callback asked to stop.
+pub const CANCELLED: &str = "Cancelled";
 
 /// Aligns `moving` onto `fixed` from one pair of clicked points (layer-local,
 /// pixel-center coordinates).
@@ -643,7 +644,7 @@ mod tests {
         let moving = Pixels::U8(mv);
         // Click the same spot (a little off on the moving photo).
         let (bx, by) = from_src.apply(800.0, 300.0).unwrap();
-        let none = |_: f32, _: &str| {};
+        let none = |_: f32, _: &str| true;
         let al = align(&fixed, &moving, [800.0, 300.0], [bx as f32 + 4.0, by as f32 - 3.0], StitchMode::Board, &none).unwrap();
         assert!((al.angle - 12.0).abs() < 2.0, "angle {}", al.angle);
         for (mx, my) in [(100.0, 100.0), (300.0, 700.0), (50.0, 900.0)] {
@@ -691,7 +692,7 @@ mod tests {
         }));
         // Document point (500, 450): at scene y 505 in the first photo, 235 in the second.
         let (mx, my) = cam.apply(600.0, 235.0).unwrap();
-        let none = |_: f32, _: &str| {};
+        let none = |_: f32, _: &str| true;
         let al = align(&fixed, &moving, [600.0, 505.0], [mx as f32, my as f32], StitchMode::Projection, &none).unwrap();
         assert!(al.quad_fixed.is_some() && al.quad_moving.is_some());
         for (sx, sy) in [(300.0, 200.0), (800.0, 300.0), (500.0, 400.0)] {

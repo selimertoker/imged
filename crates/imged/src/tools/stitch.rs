@@ -5,6 +5,7 @@
 //! Aligning and merging run on a background thread (a few seconds each for
 //! phone photos); the tool polls them while its options are drawn.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -36,12 +37,24 @@ struct Job {
     progress: Arc<Mutex<(f32, String)>>,
     /// The two layers' ids (fixed, moving) the job works on.
     layers: (LayerId, LayerId),
+    /// Their pixels when the job started.
+    sources: (Arc<Pixels>, Arc<Pixels>),
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Job {
+    /// Dropping a job (Reset, Esc, a new click) stops its thread at the next step.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 struct Aligned {
     fixed: LayerId,
     moving: LayerId,
     al: Arc<Alignment>,
+    /// The pixels that were aligned; the alignment is dropped if they change.
+    sources: (Arc<Pixels>, Arc<Pixels>),
 }
 
 pub struct StitchTool {
@@ -98,19 +111,33 @@ impl StitchTool {
         doc.layer(id).map(|l| l.pixels.clone())
     }
 
-    fn spawn(&mut self, layers: (LayerId, LayerId), label: &str, work: impl FnOnce(&(dyn Fn(f32, &str) + Sync)) -> JobResult + Send + 'static) {
+    /// Whether the layers still have exactly the pixels in `sources`.
+    fn unchanged(doc: &Document, layers: (LayerId, LayerId), sources: &(Arc<Pixels>, Arc<Pixels>)) -> bool {
+        Self::pixels(doc, layers.0).is_some_and(|p| Arc::ptr_eq(&p, &sources.0))
+            && Self::pixels(doc, layers.1).is_some_and(|p| Arc::ptr_eq(&p, &sources.1))
+    }
+
+    fn spawn(
+        &mut self,
+        layers: (LayerId, LayerId),
+        sources: (Arc<Pixels>, Arc<Pixels>),
+        label: &str,
+        work: impl FnOnce(&(dyn Fn(f32, &str) -> bool + Sync)) -> JobResult + Send + 'static,
+    ) {
         let (tx, rx) = mpsc::channel();
         let progress = Arc::new(Mutex::new((0.0, label.to_string())));
-        let p2 = progress.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (p2, c2) = (progress.clone(), cancel.clone());
         std::thread::spawn(move || {
             let report = move |f: f32, s: &str| {
                 if let Ok(mut g) = p2.lock() {
                     *g = (f, s.to_string());
                 }
+                !c2.load(Ordering::Relaxed)
             };
             let _ = tx.send(work(&report));
         });
-        self.job = Some(Job { rx, progress, layers });
+        self.job = Some(Job { rx, progress, layers, sources, cancel });
     }
 
     fn start_align(&mut self, ctx: &mut ToolCtx) {
@@ -121,7 +148,7 @@ impl StitchTool {
         };
         self.aligned = None;
         let mode = self.mode;
-        self.spawn((a.layer, b.layer), "Aligning", move |p| {
+        self.spawn((a.layer, b.layer), (fixed.clone(), moving.clone()), "Aligning", move |p| {
             JobResult::Aligned(stitch::align(&fixed, &moving, a.local, b.local, mode, p))
         });
     }
@@ -129,15 +156,16 @@ impl StitchTool {
     fn start_merge(&mut self, ctx: &mut ToolCtx) {
         let Some(al) = &self.aligned else { return };
         let (fid, mid) = (al.fixed, al.moving);
-        let (Some(fixed), Some(moving)) = (Self::pixels(ctx.doc, fid), Self::pixels(ctx.doc, mid)) else {
-            ctx.status.error("A layer to stitch is gone");
-            self.reset();
+        if !Self::unchanged(ctx.doc, (fid, mid), &al.sources) {
+            ctx.status.error("A photo changed since it was aligned: click Align again");
+            self.aligned = None;
             return;
-        };
+        }
+        let (fixed, moving) = al.sources.clone();
         let (fi, mi) = (ctx.doc.index_of(fid).unwrap_or(0), ctx.doc.index_of(mid).unwrap_or(0));
         let opt = MergeOptions { prefer_upper: self.prefer_upper, fixed_on_top: fi > mi, want_warped: self.keep_sources };
         let al = al.al.clone();
-        self.spawn((fid, mid), "Merging", move |p| JobResult::Merged(stitch::merge(&fixed, &moving, &al, opt, p)));
+        self.spawn((fid, mid), (fixed.clone(), moving.clone()), "Merging", move |p| JobResult::Merged(stitch::merge(&fixed, &moving, &al, opt, p)));
     }
 
     /// Checks the background job; returns true while it is still running.
@@ -153,7 +181,15 @@ impl StitchTool {
             }
         };
         let (fid, mid) = job.layers;
+        let sources = job.sources.clone();
         self.job = None;
+        if !Self::unchanged(ctx.doc, (fid, mid), &sources) {
+            if !matches!(msg, JobResult::Aligned(Err(_)) | JobResult::Merged(Err(_))) {
+                ctx.status.error("A photo changed while stitching, so the result was not used: try again");
+            }
+            self.aligned = None;
+            return false;
+        }
         match msg {
             JobResult::Aligned(Ok(al)) => {
                 ctx.status.info(format!(
@@ -163,12 +199,16 @@ impl StitchTool {
                     al.angle,
                     al.scale
                 ));
-                self.aligned = Some(Aligned { fixed: fid, moving: mid, al: Arc::new(al) });
+                self.aligned = Some(Aligned { fixed: fid, moving: mid, al: Arc::new(al), sources });
                 if self.auto_apply {
                     self.start_merge(ctx);
                 }
             }
-            JobResult::Aligned(Err(e)) | JobResult::Merged(Err(e)) => ctx.status.error(e),
+            JobResult::Aligned(Err(e)) | JobResult::Merged(Err(e)) => {
+                if e != stitch::CANCELLED {
+                    ctx.status.error(e);
+                }
+            }
             JobResult::Merged(Ok(out)) => {
                 let Some(off) = ctx.doc.layer(fid).map(|l| l.offset) else {
                     ctx.status.error("The fixed layer is gone");
@@ -182,7 +222,7 @@ impl StitchTool {
                     merged: Arc::new(out.merged),
                     warped: out.warped.map(|(px, r)| (Arc::new(px), at(r))),
                 };
-                if ctx.exec(Command::Stitch(apply)).is_some() {
+                if ctx.exec(Command::Stitch(apply)) == Some(imged_core::command::Outcome::Changed) {
                     ctx.status.info(match out.conflicts {
                         0 => "Stitched".to_string(),
                         1 => "Stitched; 1 region differed between the photos".to_string(),
@@ -190,6 +230,8 @@ impl StitchTool {
                     });
                     self.picks.clear();
                     self.aligned = None;
+                } else {
+                    ctx.status.error("Could not add the stitched layer (a photo is gone?)");
                 }
             }
         }
@@ -204,7 +246,8 @@ impl StitchTool {
             self.aligned = None;
         }
         if let Some(a) = &self.aligned {
-            if doc.layer(a.fixed).is_none() || doc.layer(a.moving).is_none() {
+            // Gone, or edited since (undo, a transform, painting): realign.
+            if !Self::unchanged(doc, (a.fixed, a.moving), &a.sources) {
                 self.aligned = None;
             }
         }
