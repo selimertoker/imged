@@ -34,6 +34,8 @@ use crate::pixels::Pixels;
 #[cfg(feature = "stitch")]
 #[path = "stitch_cv.rs"]
 mod cv;
+#[path = "stitch_fit.rs"]
+mod fit;
 
 /// What to align.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

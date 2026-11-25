@@ -1,17 +1,26 @@
 //! The OpenCV half of [`super`]: feature matching, the seed search, dense
 //! flow and the morphology used to find conflicting regions.
 //!
-//! Only `*_def` OpenCV functions (required arguments only) are used where
-//! the full signature changed between OpenCV versions, so this builds
-//! against any OpenCV from 4.5 on (USAC needs 4.5, SIFT in features2d 4.4).
+//! It builds against OpenCV 4.x and 5.x. OpenCV 5 moved functions between
+//! modules (calib3d and parts of imgproc became `geometry`, features2d became
+//! `features`) and added arguments to others, so only functions that are the
+//! same in both are called here: `*_def` variants with required arguments
+//! only, SIFT from whichever module has it, and the model fitting and polygon
+//! code in plain Rust (`stitch_fit.rs`).
 
-use opencv::core::{self, KeyPoint, Mat, Point, Point2f, Scalar, Size, Vec2f, Vector};
+use opencv::core::{self, KeyPoint, Mat, Point, Size, Vec2f, Vector};
 use opencv::prelude::*;
-use opencv::{calib3d, features2d, imgproc, video};
+use opencv::{imgproc, video};
 use rayon::prelude::*;
 
+use super::fit::{self, Model};
 use super::*;
 use crate::geom::Rect;
+
+// OpenCV constants whose module differs between versions (imgproc in 4.x,
+// geometry in 5.x); the values are the same in all of them.
+const DIST_L2: i32 = 2;
+const DIST_MASK_5: i32 = 5;
 
 type R<T> = Result<T, String>;
 
@@ -151,7 +160,9 @@ fn snap(a: &Gray, b: &Gray, pa: [f64; 2], pb: [f64; 2]) -> R<Snap> {
     let r = (big * 0.035) as i32;
     let s = (big * 0.05) as i32;
     let t = 2 * r + 1;
-    // Window around A's seed, padded with white.
+    // Both images are inverted (ink bright, board 0), so the zero border that
+    // warp_affine_def pads with is empty board; correlation doesn't change.
+    // Window around A's seed, padded with empty board.
     let (cx, cy) = (pa[0].round() as i32, pa[1].round() as i32);
     let ws = 2 * (s + r) + 1;
     let mut win = Gray::new(ws as usize, ws as usize);
@@ -159,16 +170,16 @@ fn snap(a: &Gray, b: &Gray, pa: [f64; 2], pb: [f64; 2]) -> R<Snap> {
         for x in 0..ws {
             let (sx, sy) = (cx - s - r + x, cy - s - r + y);
             let inside = sx >= 0 && sy >= 0 && (sx as usize) < a.w && (sy as usize) < a.h;
-            win.d[(y * ws + x) as usize] = if inside { a.at(sx as usize, sy as usize) } else { 255 };
+            win.d[(y * ws + x) as usize] = if inside { 255 - a.at(sx as usize, sy as usize) } else { 0 };
         }
     }
     let win = win.mat()?;
-    let bm = b.mat()?;
+    let bm = Gray { w: b.w, h: b.h, d: b.d.iter().map(|&v| 255 - v).collect() }.mat()?;
     let score = |ang: f64, sc: f64| -> R<(f32, f64, f64, Point)> {
         let m = sim(ang, sc, pb, [r as f64, r as f64]);
         let mm = Mat::from_slice_2d(&[[m[0], m[1], m[2]], [m[3], m[4], m[5]]]).cv()?;
         let mut patch = Mat::default();
-        imgproc::warp_affine(&bm, &mut patch, &mm, Size::new(t, t), imgproc::INTER_LINEAR, core::BORDER_CONSTANT, Scalar::all(255.0)).cv()?;
+        imgproc::warp_affine_def(&bm, &mut patch, &mm, Size::new(t, t)).cv()?;
         let mut res = Mat::default();
         imgproc::match_template_def(&win, &patch, &mut res, imgproc::TM_CCOEFF_NORMED).cv()?;
         let (mut mx, mut loc) = (0.0, Point::default());
@@ -220,15 +231,36 @@ struct Features {
     desc: Vec<f32>,
 }
 
-fn features(g: &Gray, mask: Option<&Gray>) -> R<Features> {
-    let mut sift = features2d::SIFT::create_def().cv()?;
+/// SIFT keypoints and descriptors. SIFT is in `features2d` in OpenCV 4 and
+/// in `features` in OpenCV 5.
+fn sift(img: &Mat, mask: &Mat) -> R<(Vector<KeyPoint>, Mat)> {
     let mut kps = Vector::<KeyPoint>::new();
     let mut desc = Mat::default();
-    let img = g.mat()?;
-    match mask {
-        Some(m) => sift.detect_and_compute(&img, &m.mat()?, &mut kps, &mut desc, false).cv()?,
-        None => sift.detect_and_compute(&img, &core::no_array(), &mut kps, &mut desc, false).cv()?,
+    opencv::opencv_has_module_features2d! {
+        {
+            let mut s = opencv::features2d::SIFT::create_def().cv()?;
+            s.detect_and_compute(img, mask, &mut kps, &mut desc, false).cv()?;
+        } else {
+            opencv::opencv_has_module_features! {
+                {
+                    let mut s = opencv::features::SIFT::create_def().cv()?;
+                    s.detect_and_compute(img, mask, &mut kps, &mut desc, false).cv()?;
+                } else {
+                    return Err("This OpenCV has no SIFT (features2d / features module)".into());
+                }
+            }
+        }
     }
+    Ok((kps, desc))
+}
+
+fn features(g: &Gray, mask: Option<&Gray>) -> R<Features> {
+    let img = g.mat()?;
+    let mask = match mask {
+        Some(m) => m.mat()?,
+        None => Mat::default(),
+    };
+    let (kps, desc) = sift(&img, &mask)?;
     let pts = kps.iter().map(|k| [k.pt().x, k.pt().y]).collect::<Vec<_>>();
     let desc = if pts.is_empty() { Vec::new() } else { FImg::from_mat(&desc)?.d };
     Ok(Features { pts, desc })
@@ -303,36 +335,15 @@ fn guided(h: &Homography, fa: &Features, fb: &Features, grid: &PointGrid, idx: &
         .collect()
 }
 
-fn points(v: impl Iterator<Item = [f32; 2]>) -> Vector<Point2f> {
-    v.map(|p| Point2f::new(p[0], p[1])).collect()
-}
-
-fn mat3(m: &Mat) -> R<Option<Homography>> {
-    if m.empty() {
-        return Ok(None);
-    }
-    let d = m.data_typed::<f64>().cv()?;
-    Ok(match d.len() {
-        9 => Some(Homography([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]])),
-        6 => Some(Homography([d[0], d[1], d[2], d[3], d[4], d[5], 0.0, 0.0, 1.0])),
-        _ => None,
-    })
-}
-
 /// Robust fit: a homography with enough points, a similarity with few.
 fn fit(src: &[[f32; 2]], dst: &[[f32; 2]], thr: f64) -> R<Option<(Homography, Vec<bool>)>> {
-    let (s, d) = (points(src.iter().copied()), points(dst.iter().copied()));
-    let mut mask = Mat::default();
-    let h = if src.len() >= 12 {
-        mat3(&calib3d::find_homography(&s, &d, &mut mask, calib3d::USAC_MAGSAC, thr).cv()?)?
+    Ok(if src.len() >= 12 {
+        fit::ransac(src, dst, Model::Homography, thr)
     } else if src.len() >= 3 {
-        mat3(&calib3d::estimate_affine_partial_2d(&s, &d, &mut mask, calib3d::RANSAC, thr, 2000, 0.99, 10).cv()?)?
+        fit::ransac(src, dst, Model::Similarity, thr)
     } else {
         None
-    };
-    let Some(h) = h else { return Ok(None) };
-    let inl = if mask.empty() { vec![true; src.len()] } else { mask.data_typed::<u8>().cv()?.iter().map(|&v| v != 0).collect() };
-    Ok(Some((h, inl)))
+    })
 }
 
 // ----- projected area ------------------------------------------------------
@@ -360,29 +371,17 @@ fn find_projection(g: &Gray, seed: [f64; 2]) -> R<Option<[[f32; 2]; 4]>> {
     if !(0.03..0.97).contains(&area) {
         return Ok(None);
     }
-    let mut contours = Vector::<Vector<Point>>::new();
-    imgproc::find_contours_def(&comp.mat()?, &mut contours, imgproc::RETR_EXTERNAL, imgproc::CHAIN_APPROX_SIMPLE).cv()?;
-    let Some(c) = contours.iter().max_by_key(|c| c.len()) else { return Ok(None) };
-    let mut hull = Vector::<Point>::new();
-    imgproc::convex_hull_def(&c, &mut hull).cv()?;
-    let len = imgproc::arc_length(&hull, true).cv()?;
-    let mut eps = 0.01 * len;
-    for _ in 0..12 {
-        let mut ap = Vector::<Point>::new();
-        imgproc::approx_poly_dp(&hull, &mut ap, eps, true).cv()?;
-        if ap.len() == 4 {
-            let q: Vec<[f32; 2]> = ap.iter().map(|p| [p.x as f32, p.y as f32]).collect();
-            return Ok(Some([q[0], q[1], q[2], q[3]]));
+    // Boundary pixels of the component, outlined by a quadrilateral.
+    let inside = |x: usize, y: usize| comp.d[y * g.w + x] != 0;
+    let mut edge = Vec::new();
+    for y in 0..g.h {
+        for x in 0..g.w {
+            if inside(x, y) && (x == 0 || y == 0 || x + 1 == g.w || y + 1 == g.h || !inside(x - 1, y) || !inside(x + 1, y) || !inside(x, y - 1) || !inside(x, y + 1)) {
+                edge.push([x as f64, y as f64]);
+            }
         }
-        if ap.len() < 4 {
-            break;
-        }
-        eps *= 1.4;
     }
-    let rr = imgproc::min_area_rect(&hull).cv()?;
-    let mut pts = [Point2f::default(); 4];
-    rr.points(&mut pts).cv()?;
-    Ok(Some(pts.map(|p| [p.x, p.y])))
+    Ok(fit::quad_of(&edge))
 }
 
 fn shrink_quad(q: &[[f32; 2]; 4], f: f32) -> [[f32; 2]; 4] {
@@ -391,10 +390,15 @@ fn shrink_quad(q: &[[f32; 2]; 4], f: f32) -> [[f32; 2]; 4] {
 }
 
 fn quad_mask(w: usize, h: usize, q: &[[f32; 2]; 4]) -> R<Gray> {
-    let mut m = Mat::new_rows_cols_with_default(h as i32, w as i32, core::CV_8UC1, Scalar::all(0.0)).cv()?;
-    let pts: Vector<Point> = q.iter().map(|p| Point::new(p[0].round() as i32, p[1].round() as i32)).collect();
-    imgproc::fill_convex_poly_def(&mut m, &pts, Scalar::all(255.0)).cv()?;
-    Gray::from_mat(&m)
+    let mut d = vec![0u8; w * h];
+    d.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
+        for (x, v) in row.iter_mut().enumerate() {
+            if in_quad(q, x as f32, y as f32) {
+                *v = 255;
+            }
+        }
+    });
+    Ok(Img { w, h, d })
 }
 
 // ----- align ---------------------------------------------------------------
@@ -873,7 +877,7 @@ pub(super) fn merge(fixed: &Pixels, moving: &Pixels, al: &Alignment, opt: MergeO
     let dist = |v: &[bool]| -> R<FImg> {
         let g = Gray { w, h, d: v.iter().map(|&b| b as u8 * 255).collect() };
         let mut out = Mat::default();
-        imgproc::distance_transform_def(&g.mat()?, &mut out, imgproc::DIST_L2, imgproc::DIST_MASK_5).cv()?;
+        imgproc::distance_transform_def(&g.mat()?, &mut out, DIST_L2, DIST_MASK_5).cv()?;
         FImg::from_mat(&out)
     };
     let (da, db) = (dist(&ava)?, dist(&bva)?);
