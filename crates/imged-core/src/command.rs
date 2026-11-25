@@ -103,6 +103,8 @@ pub enum Command {
     /// Replaces the whole image with these layers (the first on top); the
     /// canvas takes the largest size.
     ReplaceImage { results: Vec<NewLayer>, label: String },
+    /// Adds a stitched layer above two aligned photos (see [`crate::ops::stitch`]).
+    Stitch(crate::ops::stitch::StitchApply),
     Flatten,
     /// Split the active layer into R, G, B and A grayscale layers.
     SplitChannels,
@@ -184,6 +186,7 @@ impl Command {
             Command::Pen { .. } => "Pen".into(),
             Command::TileLayers { .. } => "Tile layers".into(),
             Command::FitCanvasToLayers => "Fit canvas to layers".into(),
+            Command::Stitch(_) => "Stitch".into(),
             Command::Shape { shape, .. } => shape.kind.label().into(),
             Command::Fill { .. } => "Fill".into(),
             Command::Text { .. } => "Text".into(),
@@ -456,6 +459,7 @@ impl Command {
                     true
                 }))
             }
+            Command::Stitch(a) => changed(crate::ops::stitch::apply(doc, a)),
             Command::Flatten => changed(doc.flatten()),
             Command::SplitChannels => changed(doc.split_channels()),
             Command::MergeChannels(ids) => changed(doc.merge_channels(ids)),

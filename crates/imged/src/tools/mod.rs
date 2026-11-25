@@ -18,6 +18,7 @@ mod shape;
 mod text;
 mod resize;
 mod rotate;
+mod stitch;
 mod warp;
 
 use eframe::egui::{self, CursorIcon, Key, Painter, Ui};
@@ -47,10 +48,11 @@ pub enum ToolKind {
     Rotate,
     Tilt,
     Shear,
+    Stitch,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 14] = [
+    pub const ALL: [ToolKind; 15] = [
         ToolKind::Move,
         ToolKind::Brush,
         ToolKind::Pen,
@@ -65,6 +67,7 @@ impl ToolKind {
         ToolKind::Rotate,
         ToolKind::Tilt,
         ToolKind::Shear,
+        ToolKind::Stitch,
     ];
 
     pub fn name(self) -> &'static str {
@@ -83,6 +86,7 @@ impl ToolKind {
             ToolKind::Rotate => "Rotate",
             ToolKind::Tilt => "Tilt (perspective)",
             ToolKind::Shear => "Shear",
+            ToolKind::Stitch => "Stitch photos",
         }
     }
 
@@ -102,6 +106,7 @@ impl ToolKind {
             ToolKind::Rotate => Key::R,
             ToolKind::Tilt => Key::P,
             ToolKind::Shear => Key::H,
+            ToolKind::Stitch => Key::J,
         }
     }
 
@@ -129,6 +134,9 @@ impl ToolKind {
             ToolKind::Rotate => "Drag on the canvas or set the angle; the anchor is the point it turns around. Enter applies.",
             ToolKind::Tilt => "Drag an edge handle to tilt in 3D around the opposite edge.",
             ToolKind::Shear => "Drag an edge handle along the edge to slant.",
+            ToolKind::Stitch => {
+                "Click a letter on the photo that stays put, then the same letter on the other photo. They are aligned and merged into a new layer. Right click undoes a click."
+            }
         }
     }
 }
@@ -299,6 +307,7 @@ pub fn create_tools() -> Vec<Box<dyn Tool>> {
                 ToolKind::Rotate => Box::new(rotate::RotateTool::default()),
                 ToolKind::Tilt => Box::new(warp::WarpTool::new(warp::WarpMode::Tilt)),
                 ToolKind::Shear => Box::new(warp::WarpTool::new(warp::WarpMode::Shear)),
+                ToolKind::Stitch => Box::new(stitch::StitchTool::default()),
             }
         })
         .collect()

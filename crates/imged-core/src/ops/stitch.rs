@@ -491,8 +491,14 @@ pub fn apply(doc: &mut Document, a: &StitchApply) -> bool {
         }
         d.active = id;
         d.selected.retain(|s| *s != a.fixed && *s != a.moving);
-        // Grow (never shrink) the canvas to contain every layer.
-        let u = d.layers.iter().fold(d.canvas_rect(), |u, l| u.union(&l.bounds()));
+        // Fit the canvas to the visible layers that have something in them
+        // (the stitched one included), so nothing visible is cut off and an
+        // empty background left over from tiling the photos doesn't count.
+        let u = d
+            .layers
+            .iter()
+            .filter(|l| l.visible && (l.id == id || has_content(&l.pixels)))
+            .fold(Rect::default(), |u, l| u.union(&l.bounds()));
         if u != d.canvas_rect() {
             d.width = u.w;
             d.height = u.h;
@@ -505,6 +511,10 @@ pub fn apply(doc: &mut Document, a: &StitchApply) -> bool {
         }
         true
     })
+}
+
+fn has_content(p: &Pixels) -> bool {
+    crate::dispatch!(p, b => b.data.par_chunks(4 * 4096).any(|c| c.chunks(4).any(|px| px[3].to_f32() > 0.0)))
 }
 
 #[cfg(test)]
@@ -554,7 +564,7 @@ mod tests {
             warped: Some((Arc::new(Pixels::new(crate::Depth::U8, 12, 10)), (8, 0))),
         };
         assert!(apply(&mut doc, &ap));
-        assert_eq!(doc.width, 25);
+        assert_eq!((doc.width, doc.height), (25, 10));
         assert_eq!(doc.layers.len(), 3);
         let top = doc.layers.last().unwrap();
         assert_eq!(top.name, "Stitched");
@@ -564,5 +574,135 @@ mod tests {
         doc.undo();
         assert_eq!(doc.layers.len(), 2);
         assert_eq!(doc.width, 10);
+    }
+    /// A fake whiteboard: rows of random handwriting-like strokes.
+    #[cfg(feature = "stitch")]
+    fn board(w: u32, h: u32) -> Buffer<u8> {
+        let mut b = Buffer::<u8>::filled(w, h, [0.93, 0.93, 0.9, 1.0]);
+        let mut seed = 12345u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let mut y = 40.0;
+        while y < h as f32 - 40.0 {
+            let mut x = 30.0;
+            while x < w as f32 - 60.0 {
+                // A "letter": a few connected segments.
+                let (mut px, mut py) = (x + rnd() * 6.0, y + rnd() * 20.0);
+                for _ in 0..3 + (rnd() * 3.0) as usize {
+                    let (nx, ny) = (x + rnd() * 22.0, y + rnd() * 28.0);
+                    let n = ((nx - px).hypot(ny - py) * 2.0) as usize + 1;
+                    for k in 0..=n {
+                        let t = k as f32 / n as f32;
+                        let (cx, cy) = (px + (nx - px) * t, py + (ny - py) * t);
+                        for dy in -2..=2 {
+                            for dx in -2..=2 {
+                                let (ix, iy) = (cx as i32 + dx, cy as i32 + dy);
+                                if (dx * dx + dy * dy) <= 3 && b.in_bounds(ix, iy) {
+                                    b.set(ix as u32, iy as u32, [0.1, 0.1, 0.15, 1.0]);
+                                }
+                            }
+                        }
+                    }
+                    (px, py) = (nx, ny);
+                }
+                x += 30.0 + rnd() * 25.0;
+            }
+            y += 55.0 + rnd() * 15.0;
+        }
+        b
+    }
+
+    #[cfg(feature = "stitch")]
+    #[test]
+    fn aligns_rotated_scaled_photo_and_keeps_new_ink() {
+        let src = board(1700, 1000);
+        // Fixed photo: the left part. Moving photo: the right part, turned
+        // 12° and seen 10% larger, with extra writing in the overlap.
+        let fixed = Pixels::U8(src.crop(Rect::new(0, 0, 1000, 1000)));
+        let g = Homography::scale(1.0, 1.0);
+        let (a, s) = (12f64.to_radians(), 1.0 / 1.1);
+        // Moving pixel -> source pixel.
+        let to_src = Homography([s * a.cos(), -s * a.sin(), 650.0, s * a.sin(), s * a.cos(), 60.0, 0.0, 0.0, 1.0]).mul(&g);
+        let mut mv = Buffer::<u8>::from_fn(1000, 1000, |x, y| {
+            let (sx, sy) = to_src.apply(x as f64, y as f64).unwrap();
+            src.sample_bilinear(sx as f32 + 0.5, sy as f32 + 0.5)
+        });
+        // New ink only in the moving photo, centered at source (850, 520).
+        let from_src = to_src.inverse().unwrap();
+        let (nx, ny) = from_src.apply(850.0, 520.0).unwrap();
+        // An "X" written in between the two photos.
+        for t in -25..=25 {
+            for w in -2..=2 {
+                for (dx, dy) in [(t, t + w), (t, -t + w)] {
+                    mv.set((nx as i32 + dx) as u32, (ny as i32 + dy) as u32, [0.05, 0.05, 0.05, 1.0]);
+                }
+            }
+        }
+        let moving = Pixels::U8(mv);
+        // Click the same spot (a little off on the moving photo).
+        let (bx, by) = from_src.apply(800.0, 300.0).unwrap();
+        let none = |_: f32, _: &str| {};
+        let al = align(&fixed, &moving, [800.0, 300.0], [bx as f32 + 4.0, by as f32 - 3.0], StitchMode::Board, &none).unwrap();
+        assert!((al.angle - 12.0).abs() < 2.0, "angle {}", al.angle);
+        for (mx, my) in [(100.0, 100.0), (300.0, 700.0), (50.0, 900.0)] {
+            let (sx, sy) = to_src.apply(mx, my).unwrap();
+            let p = al.forward(mx as f32, my as f32).unwrap();
+            assert!((p[0] - sx as f32).hypot(p[1] - sy as f32) < 1.5, "({mx},{my}) -> {p:?}, want ({sx},{sy})");
+        }
+        let at = |out: &StitchOutput| {
+            let (x, y) = (850 - out.merged_rect.x, 520 - out.merged_rect.y);
+            out.merged.get(x as u32, y as u32)[0]
+        };
+        let opt = MergeOptions { prefer_upper: false, fixed_on_top: true, want_warped: true };
+        let ink = merge(&fixed, &moving, &al, opt, &none).unwrap();
+        assert!(ink.conflicts >= 1);
+        assert!(at(&ink) < 0.3, "new ink kept: {}", at(&ink));
+        assert!(ink.merged_rect.w > 1500 && ink.warped.is_some());
+        let upper = merge(&fixed, &moving, &al, MergeOptions { prefer_upper: true, ..opt }, &none).unwrap();
+        assert!(at(&upper) > 0.7, "upper (fixed) layer wins: {}", at(&upper));
+    }
+    /// Two photos of a document projected onto a board, scrolled by 300
+    /// document pixels between them, the camera turned 3°. Marks on the board
+    /// around the projection don't move with the document and must be ignored.
+    #[cfg(feature = "stitch")]
+    #[test]
+    fn projection_mode_follows_the_document() {
+        let doc = board(1000, 1400);
+        let marks = board(1200, 900);
+        let (ox, oy, sc) = (150.0f64, 100.0f64, 0.9f64);
+        let scene = |sx: f64, sy: f64, scroll: f64| -> Px {
+            if (ox..ox + 900.0).contains(&sx) && (oy..oy + 700.0).contains(&sy) {
+                doc.sample_bilinear(((sx - ox) / sc) as f32 + 0.5, ((sy - oy) / sc + scroll) as f32 + 0.5)
+            } else {
+                let m = marks.sample_bilinear(sx as f32 + 0.5, sy as f32 + 0.5);
+                [m[0] * 0.45, m[1] * 0.45, m[2] * 0.45, 1.0]
+            }
+        };
+        let a = 3f64.to_radians();
+        // Camera of the second photo: scene -> photo.
+        let cam = Homography([a.cos(), -a.sin(), 25.0, a.sin(), a.cos(), -10.0, 0.0, 0.0, 1.0]);
+        let cam_inv = cam.inverse().unwrap();
+        let fixed = Pixels::U8(Buffer::from_fn(1200, 900, |x, y| scene(x as f64, y as f64, 0.0)));
+        let moving = Pixels::U8(Buffer::from_fn(1200, 900, |x, y| {
+            let (sx, sy) = cam_inv.apply(x as f64, y as f64).unwrap();
+            scene(sx, sy, 300.0)
+        }));
+        // Document point (500, 450): at scene y 505 in the first photo, 235 in the second.
+        let (mx, my) = cam.apply(600.0, 235.0).unwrap();
+        let none = |_: f32, _: &str| {};
+        let al = align(&fixed, &moving, [600.0, 505.0], [mx as f32, my as f32], StitchMode::Projection, &none).unwrap();
+        assert!(al.quad_fixed.is_some() && al.quad_moving.is_some());
+        for (sx, sy) in [(300.0, 200.0), (800.0, 300.0), (500.0, 400.0)] {
+            let (px, py) = cam.apply(sx, sy).unwrap();
+            let p = al.forward(px as f32, py as f32).unwrap();
+            let want = (sx as f32, sy as f32 + 270.0);
+            assert!((p[0] - want.0).hypot(p[1] - want.1) < 2.0, "({sx},{sy}) -> {p:?}, want {want:?}");
+        }
+        let out = merge(&fixed, &moving, &al, MergeOptions { prefer_upper: false, fixed_on_top: true, want_warped: false }, &none).unwrap();
+        // Only the projected document is kept: about 900 wide, 700 + 270 tall.
+        let r = out.merged_rect;
+        assert!((880..=960).contains(&r.w) && (940..=1020).contains(&r.h), "{r:?}");
     }
 }

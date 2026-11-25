@@ -41,7 +41,13 @@ cargo run --release -p imged -- [image] [more images as layers…]
   sample type (8/16/32-bit integer, 32/64-bit float, either endianness),
   size, header bytes, row padding, planar storage and row order. A live
   preview and the sizes that fit the file exactly are shown.
-* Run the core tests with `cargo test -p imged-core`.
+* **Stitching photos** (the Stitch tool) needs the system **OpenCV 4.x**
+  development files and **libclang**: build with `--features stitch`, e.g.
+  `cargo run --release -p imged --features stitch`. Packages:
+  `libopencv-dev clang libclang-dev` (Debian/Ubuntu), `opencv-devel clang-devel`
+  (Fedora), `opencv clang` (Arch). Without it the tool is shown but can't run.
+* Run the core tests with `cargo test -p imged-core` (add `--features stitch`
+  to include the stitching tests).
 
 ## The window
 
@@ -70,6 +76,7 @@ cargo run --release -p imged -- [image] [more images as layers…]
 | R | Rotate | Drag on the canvas or set the angle. With snapping on, dragging sticks to multiples of 45° (Alt turns freely); Shift snaps to 15°. The **anchor** drawn on the canvas is the point it turns around: drag it anywhere (with snapping on it snaps to edges, to the middle of the canvas/selection and to the corners, edge middles and center of what is rotated); **Center anchor** puts it back. Live preview; the result is trimmed. Enter or Apply commits. |
 | P | Tilt | Drag an edge handle (or pick the edge with an arrow) to tilt in 3D. It hinges on the opposite edge. Drag inward to tilt away, outward to tilt toward you. |
 | H | Shear | Drag an edge handle along the edge to turn the area into a parallelogram. |
+| J | Stitch photos | Click a letter on one photo, then the same letter on another: the second is aligned onto the first and both are merged into a new layer. See *Stitching photos*. |
 
 Resize, Rotate, Tilt and Shear, the flip and 90° buttons, and the color
 filters act on the **Apply to** choice: the active
@@ -188,6 +195,38 @@ square image, and fits the canvas to them. A bottom layer of one uniform
 color is treated as the background and left out; any other bottom layer is
 tiled too. With layers ticked, only those (and the active one) are tiled,
 starting from their top-left corner, and the canvas only grows if needed.
+
+**Stitching photos.** For photos of a whiteboard taken in parts, from
+different angles (camera turned up to about 30°). Open the photos as layers
+and **Tile** them (or hide the top one) so you can see both, pick the Stitch
+tool (J), click a letter or symbol on the photo that should stay in place,
+then the same letter on the other photo (right click takes a click back).
+Starting from that pair, imged searches the rotation and scale between the
+two clicks, then matches the letters around them, ring by ring outward, so
+repeated letters and empty board don't confuse it. The matched points are
+shown (green on the first photo, blue on the second) with the median error;
+**Stitch** (Enter) merges. Repeat with the result and the next photo to
+stitch more than two.
+
+* The alignment is a perspective transform plus a smooth correction for lens
+  distortion and boards that aren't perfectly flat, refined densely where the
+  photos overlap so strokes don't double.
+* Lighting is evened out across the overlap, so there is no seam.
+* Where the photos **disagree** (something was written or erased between the
+  shots), each region comes from the photo that has **ink** there, or, with
+  **Prefer upper layer where they differ**, from the photo higher in the
+  layer list.
+* **Projection** mode is for a document projected onto the board and scrolled
+  between the photos: click inside the projected (brightest) area. Only that
+  area is aligned and kept, so the board and wall, which did not move with
+  the document, are left out. It is outlined in yellow after aligning.
+* The result is a new layer, **Stitched**, above the photos. With **Keep the
+  photos as hidden layers** (default) the photos stay, hidden, with the
+  second one warped into place for touch-ups; otherwise they are removed. The
+  canvas is fitted to the visible layers. It is one undo step.
+* The same code runs from the command line:
+  `cargo run --release -p imged-core --features stitch --example stitch --
+  fixed.heic moving.heic FX FY MX MY out.png [--prefer-upper] [--projection]`.
 
 **ImageMagick.** **Layer → Edit with ImageMagick…** (or **Image → …** for
 the whole image) saves the active layer and the ticked ones (or the
@@ -347,7 +386,8 @@ crates/
     command.rs    Command enum: the single entry point for edits
     ops/          filters (incl. filter-layer settings), convolve, transform (layer /
                   image / selection scopes via one piece planner), paint, fill,
-                  outline, edges, layout, text
+                  outline, edges, layout, text, stitch (photo stitching; the
+                  OpenCV part is stitch_cv.rs, behind the `stitch` feature)
     io.rs         load/save via `image` + a PFM reader/writer
     io/psd.rs     PSD projects (ag-psd, raw 16/32-bit channel coding)
     io/raw.rs     headerless raw pixel decoding

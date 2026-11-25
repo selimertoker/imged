@@ -214,6 +214,16 @@ pub fn paint_icon(painter: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                     s,
                 ));
             }
+            ToolKind::Stitch => {
+                // Two overlapping photos, the second turned a little.
+                painter.rect_stroke(Rect::from_min_max(p(r, 0.0, 0.12), p(r, 0.6, 0.72)), 0.0, s, StrokeKind::Middle);
+                painter.add(Shape::convex_polygon(
+                    vec![p(r, 0.42, 0.2), p(r, 1.0, 0.32), p(r, 0.9, 0.92), p(r, 0.32, 0.8)],
+                    Color32::TRANSPARENT,
+                    s,
+                ));
+                painter.circle_filled(p(r, 0.48, 0.5), r.width() * 0.1, c);
+            }
         },
         Icon::FlipH => {
             painter.add(Shape::convex_polygon(vec![p(r, 0.42, 0.1), p(r, 0.42, 0.9), p(r, 0.0, 0.9)], c, Stroke::NONE));
