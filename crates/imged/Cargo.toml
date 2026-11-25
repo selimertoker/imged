@@ -31,3 +31,5 @@ heif = ["imged-core/heif"]
 jxl = ["imged-core/jxl"]
 # AVIF decoding through libdav1d (needs the system library).
 avif-decode = ["imged-core/avif-decode"]
+# The Stitch tool's automatic alignment (needs the system OpenCV and libclang).
+stitch = ["imged-core/stitch"]

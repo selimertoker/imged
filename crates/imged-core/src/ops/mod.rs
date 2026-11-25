@@ -8,5 +8,6 @@ pub mod filters;
 pub mod layout;
 pub mod outline;
 pub mod paint;
+pub mod stitch;
 pub mod text;
 pub mod transform;
